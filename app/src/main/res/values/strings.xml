@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ExpenseTracker</string>
+    <string name="accessibility_service_description">Shows capture overlay in GPay and PhonePe to save payment screenshots.</string>
+</resources>
