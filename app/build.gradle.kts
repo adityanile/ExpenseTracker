@@ -9,6 +9,18 @@ android {
         version = release(37)
     }
 
+    val azureEndpoint = providers.gradleProperty("AZURE_CONTENT_UNDERSTANDING_ENDPOINT").orNull ?: ""
+    val azureKey = providers.gradleProperty("AZURE_CONTENT_UNDERSTANDING_KEY").orNull ?: ""
+    val azureAnalyzerId = providers.gradleProperty("AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID").orNull ?: "expenseanalyser"
+    val azureApiVersion = providers.gradleProperty("AZURE_CONTENT_UNDERSTANDING_API_VERSION").orNull ?: "2025-11-01"
+
+    fun String.asBuildConfigValue(): String {
+        val escaped = this
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+        return "\"$escaped\""
+    }
+
     defaultConfig {
         applicationId = "com.adityanile.expensetracker"
         minSdk = 24
@@ -17,6 +29,11 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_ENDPOINT", azureEndpoint.asBuildConfigValue())
+        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_KEY", azureKey.asBuildConfigValue())
+        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID", azureAnalyzerId.asBuildConfigValue())
+        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_API_VERSION", azureApiVersion.asBuildConfigValue())
     }
 
     buildTypes {
@@ -33,6 +50,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

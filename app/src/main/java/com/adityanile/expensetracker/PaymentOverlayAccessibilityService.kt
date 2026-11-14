@@ -2,11 +2,13 @@ package com.adityanile.expensetracker
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -14,8 +16,14 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
+import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
@@ -24,6 +32,8 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var overlayView: View? = null
     private var overlayLayoutParams: WindowManager.LayoutParams? = null
+    private var resultCardView: View? = null
+    private var isProcessingCapture = false
     private var edgeState = EdgeState.RIGHT
 
     override fun onServiceConnected() {
@@ -65,8 +75,8 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
 
         try {
             val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            val bubbleSize = dp(46)
-            val visiblePeek = dp(14)
+            val bubbleSize = dp(44)
+            val visiblePeek = dp(12)
             val dragThreshold = dp(6)
             val metrics = resources.displayMetrics
             val screenWidth = metrics.widthPixels
@@ -77,13 +87,23 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                 minimumHeight = bubbleSize
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.argb(232, 255, 255, 255))
-                    setStroke(dp(1), Color.argb(160, 35, 35, 35))
+                    setColor(Color.argb(242, 37, 40, 44))
+                    setStroke(dp(1), Color.argb(130, 170, 170, 170))
                 }
                 alpha = ACTIVE_ALPHA
-                elevation = dp(10).toFloat()
+                elevation = dp(12).toFloat()
                 isClickable = true
                 isFocusable = false
+
+                addView(
+                    View(context).apply {
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.OVAL
+                            setColor(Color.argb(250, 125, 211, 252))
+                        }
+                    },
+                    FrameLayout.LayoutParams(dp(12), dp(12), Gravity.CENTER),
+                )
             }
 
             val leftHiddenX = -(bubbleSize - visiblePeek)
@@ -148,7 +168,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                         MotionEvent.ACTION_UP -> {
                             if (!dragged) {
                                 view.performClick()
-                                triggerCapture()
+                                triggerCaptureAndAnalyze()
                             }
                             snapToEdge(windowManager, bubble, layoutParams, leftHiddenX, rightHiddenX)
                             mainHandler.postDelayed(idleRunnable, IDLE_DELAY_MS)
@@ -177,6 +197,261 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun triggerCaptureAndAnalyze() {
+        if (isProcessingCapture) {
+            Toast.makeText(applicationContext, "Processing in progress", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val settings = AzureAnalyzerSettingsProvider.fromBuildConfig()
+        if (!settings.isConfigured()) {
+            Toast.makeText(
+                applicationContext,
+                "Azure secrets missing in Gradle properties",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+
+        isProcessingCapture = true
+        Toast.makeText(applicationContext, "Processing screenshot…", Toast.LENGTH_SHORT).show()
+
+        thread {
+            val captureResult = ScreenCaptureManager.captureBitmap()
+            if (captureResult.isFailure) {
+                isProcessingCapture = false
+                val errorMessage = captureResult.exceptionOrNull()?.message
+                    ?: "Capture failed. Open app and grant permission first."
+                mainHandler.post {
+                    Toast.makeText(applicationContext, errorMessage, Toast.LENGTH_LONG).show()
+                }
+                return@thread
+            }
+
+            val bitmap = captureResult.getOrThrow()
+            val imageBytes = bitmap.toPngBytes()
+            bitmap.recycle()
+
+            val analyzeResult = AzureContentUnderstandingClient.analyzeImageBytes(imageBytes, settings)
+            isProcessingCapture = false
+
+            mainHandler.post {
+                if (analyzeResult.isSuccess) {
+                    showEditableFieldsCard(analyzeResult.getOrNull().orEmpty())
+                } else {
+                    val message = analyzeResult.exceptionOrNull()?.message ?: "Azure analysis failed"
+                    Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun showEditableFieldsCard(fields: List<AzureExtractedField>) {
+        val editableValues = linkedMapOf<String, EditText>()
+
+        val scrollContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+
+            addView(TextView(context).apply {
+                text = "Expense Details"
+                setTextColor(Color.argb(255, 237, 237, 237))
+                textSize = 17f
+            })
+
+            if (fields.isEmpty()) {
+                addView(TextView(context).apply {
+                    text = "No fields extracted"
+                    setTextColor(Color.argb(220, 186, 186, 186))
+                    textSize = 14f
+                    setPadding(0, dp(8), 0, dp(10))
+                })
+            } else {
+                fields.forEach { field ->
+                    val fieldContainer = LinearLayout(context).apply {
+                        orientation = LinearLayout.VERTICAL
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.RECTANGLE
+                            cornerRadius = dp(12).toFloat()
+                            setColor(Color.argb(255, 46, 50, 56))
+                            setStroke(dp(1), Color.argb(95, 100, 100, 100))
+                        }
+                        setPadding(dp(10), dp(8), dp(10), dp(10))
+                    }
+
+                    fieldContainer.addView(TextView(context).apply {
+                        text = field.name
+                        setTextColor(Color.argb(255, 175, 214, 255))
+                        textSize = 12f
+                        setPadding(0, 0, 0, dp(4))
+                    })
+
+                    val input = EditText(context).apply {
+                        setText(field.value)
+                        setTextColor(Color.argb(255, 242, 242, 242))
+                        setHintTextColor(Color.argb(180, 175, 175, 175))
+                        hint = "Update ${field.name}"
+                        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.RECTANGLE
+                            cornerRadius = dp(10).toFloat()
+                            setColor(Color.argb(255, 33, 35, 39))
+                            setStroke(dp(1), Color.argb(80, 95, 95, 95))
+                        }
+                        setPadding(dp(10), dp(9), dp(10), dp(9))
+                    }
+                    editableValues[field.name] = input
+                    fieldContainer.addView(input)
+
+                    addView(
+                        fieldContainer,
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                        ).apply { bottomMargin = dp(8) },
+                    )
+                }
+            }
+
+            val buttonsRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                setPadding(0, dp(12), 0, 0)
+            }
+
+            buttonsRow.addView(createSecondaryButton("Close").apply {
+                setOnClickListener { hideResultCardSafely() }
+            })
+
+            buttonsRow.addView(createPrimaryButton("Save").apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { marginStart = dp(8) }
+
+                setOnClickListener {
+                    val savedData = editableValues
+                        .mapValues { (_, value) -> value.text?.toString().orEmpty().trim() }
+                        .filterValues { it.isNotBlank() }
+
+                    if (savedData.isEmpty()) {
+                        Toast.makeText(applicationContext, "Nothing to save", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+
+                    ExpenseAnalysisStore.saveRecord(applicationContext, savedData)
+                    Toast.makeText(applicationContext, "Analysis data saved", Toast.LENGTH_SHORT).show()
+                    hideResultCardSafely()
+                }
+            })
+
+            addView(buttonsRow)
+        }
+
+        val scrollView = ScrollView(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(scrollContent)
+        }
+
+        showCard(scrollView)
+    }
+
+    private fun showCard(contentView: View) {
+        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        hideResultCardSafely()
+
+        val cardContainer = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(18).toFloat()
+                setColor(Color.argb(248, 28, 31, 35))
+                setStroke(dp(1), Color.argb(95, 90, 90, 90))
+            }
+            elevation = dp(16).toFloat()
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+            addView(contentView)
+        }
+
+        val maxWidth = (resources.displayMetrics.widthPixels * 0.93f).toInt()
+        val maxHeight = (resources.displayMetrics.heightPixels * 0.68f).toInt()
+
+        val params = WindowManager.LayoutParams(
+            maxWidth,
+            maxHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = dp(72)
+        }
+
+        try {
+            windowManager.addView(cardContainer, params)
+            resultCardView = cardContainer
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to show result card", error)
+        }
+    }
+
+    private fun hideResultCardSafely() {
+        val currentCard = resultCardView ?: return
+        try {
+            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            windowManager.removeView(currentCard)
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed to remove result card", error)
+        } finally {
+            resultCardView = null
+        }
+    }
+
+    private fun createPrimaryButton(label: String): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(255, 52, 122, 201))
+            }
+        }
+    }
+
+    private fun createSecondaryButton(label: String): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.argb(255, 225, 225, 225))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(255, 54, 57, 62))
+                setStroke(dp(1), Color.argb(80, 130, 130, 130))
+            }
+        }
+    }
+
+    private fun hideOverlaySafely() {
+        val currentView = overlayView
+        try {
+            mainHandler.removeCallbacksAndMessages(null)
+            hideResultCardSafely()
+            currentView?.let {
+                val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                windowManager.removeView(it)
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed to remove overlay", error)
+        } finally {
+            overlayView = null
+            overlayLayoutParams = null
+            isProcessingCapture = false
+        }
+    }
+
     private fun snapToEdge(
         windowManager: WindowManager,
         bubble: View,
@@ -190,39 +465,10 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         windowManager.updateViewLayout(bubble, layoutParams)
     }
 
-    private fun triggerCapture() {
-        thread {
-            val result = ScreenCaptureManager.capture(applicationContext)
-            Handler(Looper.getMainLooper()).post {
-                if (result.isSuccess) {
-                    Toast.makeText(
-                        applicationContext,
-                        "Saved: ${result.getOrThrow().name}",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                } else {
-                    Toast.makeText(
-                        applicationContext,
-                        "Capture failed. Open app and grant permission first.",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
-            }
-        }
-    }
-
-    private fun hideOverlaySafely() {
-        val currentView = overlayView ?: return
-        try {
-            mainHandler.removeCallbacksAndMessages(null)
-            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            windowManager.removeView(currentView)
-        } catch (error: Throwable) {
-            Log.w(TAG, "Failed to remove overlay", error)
-        } finally {
-            overlayView = null
-            overlayLayoutParams = null
-        }
+    private fun Bitmap.toPngBytes(): ByteArray {
+        val stream = ByteArrayOutputStream()
+        compress(Bitmap.CompressFormat.PNG, 100, stream)
+        return stream.toByteArray()
     }
 
     private fun dp(value: Int): Int {
@@ -237,7 +483,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         private const val TAG = "PaymentOverlayService"
         private const val IDLE_DELAY_MS = 2000L
         private const val ACTIVE_ALPHA = 0.98f
-        private const val IDLE_ALPHA = 0.45f
+        private const val IDLE_ALPHA = 0.55f
     }
 
     private enum class EdgeState {

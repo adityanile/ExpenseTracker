@@ -80,6 +80,16 @@ object ScreenCaptureManager {
 
     @Synchronized
     fun capture(context: Context): Result<File> {
+        return captureBitmap()
+            .mapCatching { bitmap ->
+                val file = ScreenshotStore.save(context, bitmap)
+                bitmap.recycle()
+                file
+            }
+    }
+
+    @Synchronized
+    fun captureBitmap(): Result<Bitmap> {
         if (mediaProjection == null) {
             return Result.failure(IllegalStateException("Screen capture not initialized"))
         }
@@ -92,9 +102,7 @@ object ScreenCaptureManager {
 
             image.use {
                 val bitmap = imageToBitmap(image, displayWidth, displayHeight)
-                val file = ScreenshotStore.save(context, bitmap)
-                bitmap.recycle()
-                Result.success(file)
+                Result.success(bitmap)
             }
         } catch (security: SecurityException) {
             release()

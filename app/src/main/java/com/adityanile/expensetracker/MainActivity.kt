@@ -7,7 +7,10 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +31,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -54,6 +58,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.adityanile.expensetracker.ui.theme.ExpenseTrackerTheme
 import java.io.File
+import java.text.DateFormat
+import java.util.Date
+import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
 
@@ -113,16 +120,60 @@ private fun MainScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
 
     var screenshots by remember { mutableStateOf(ScreenshotStore.listScreenshots(context)) }
+    var savedAnalyses by remember { mutableStateOf(ExpenseAnalysisStore.loadRecords(context)) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
     var capturePermissionReady by remember { mutableStateOf(ScreenCaptureManager.isReady()) }
     var accessibilityReady by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
     var notificationReady by remember { mutableStateOf(isNotificationPermissionGranted(context)) }
+    val azureSettings = remember { AzureAnalyzerSettingsProvider.fromBuildConfig() }
+
+    var analysisFieldsByPath by remember { mutableStateOf<Map<String, List<AzureExtractedField>>>(emptyMap()) }
+    var analysisErrorByPath by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var analysisInProgressPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     fun refreshAll() {
         screenshots = ScreenshotStore.listScreenshots(context)
+        savedAnalyses = ExpenseAnalysisStore.loadRecords(context)
         capturePermissionReady = ScreenCaptureManager.isReady()
         accessibilityReady = isAccessibilityServiceEnabled(context)
         notificationReady = isNotificationPermissionGranted(context)
+
+        val validPaths = screenshots.map { it.absolutePath }.toSet()
+        analysisFieldsByPath = analysisFieldsByPath.filterKeys { it in validPaths }
+        analysisErrorByPath = analysisErrorByPath.filterKeys { it in validPaths }
+        analysisInProgressPaths = analysisInProgressPaths.filter { it in validPaths }.toSet()
+    }
+
+    fun runAnalysis(file: File) {
+        if (!azureSettings.isConfigured()) {
+            Toast.makeText(
+                context,
+                "Azure analyzer is not configured in app secrets.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+
+        val path = file.absolutePath
+        analysisInProgressPaths = analysisInProgressPaths + path
+        analysisErrorByPath = analysisErrorByPath - path
+
+        thread {
+            val result = AzureContentUnderstandingClient.analyzeScreenshot(file, azureSettings)
+            Handler(Looper.getMainLooper()).post {
+                analysisInProgressPaths = analysisInProgressPaths - path
+                if (result.isSuccess) {
+                    val fields = result.getOrNull().orEmpty()
+                    analysisFieldsByPath = analysisFieldsByPath + (path to fields)
+                    analysisErrorByPath = analysisErrorByPath - path
+                } else {
+                    analysisFieldsByPath = analysisFieldsByPath - path
+                    analysisErrorByPath = analysisErrorByPath + (
+                        path to (result.exceptionOrNull()?.message ?: "Analysis failed")
+                        )
+                }
+            }
+        }
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -176,13 +227,33 @@ private fun MainScreen(
                 ) {
                     Text(
                         text = if (setupDone) {
-                            "Setup complete. Tap floating Capture button anywhere to save payment screenshots."
+                            "Setup complete. Tap floating Capture button anywhere to save payment screenshots. Tap Analyze to extract fields."
                         } else {
                             "Complete setup once. This card disappears automatically after permissions are ready."
                         },
                         modifier = Modifier.padding(14.dp),
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                }
+            }
+
+            item {
+                Text(
+                    text = "Saved Analyses",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+
+            if (savedAnalyses.isEmpty()) {
+                item {
+                    Text(
+                        text = "No saved analysis records yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            } else {
+                items(savedAnalyses, key = { it.id }) { record ->
+                    SavedAnalysisItem(record = record)
                 }
             }
 
@@ -196,11 +267,19 @@ private fun MainScreen(
                 }
             } else {
                 items(screenshots, key = { it.absolutePath }) { file ->
+                    val path = file.absolutePath
                     ScreenshotItem(
                         file = file,
+                        extractedFields = analysisFieldsByPath[path].orEmpty(),
+                        analysisError = analysisErrorByPath[path],
+                        isAnalyzing = path in analysisInProgressPaths,
                         onOpen = { selectedFile = file },
+                        onAnalyze = { runAnalysis(file) },
                         onDelete = {
                             ScreenshotStore.delete(file)
+                            analysisFieldsByPath = analysisFieldsByPath - path
+                            analysisErrorByPath = analysisErrorByPath - path
+                            analysisInProgressPaths = analysisInProgressPaths - path
                             refreshAll()
                         },
                     )
@@ -213,7 +292,11 @@ private fun MainScreen(
         ScreenshotViewer(
             file = file,
             onDelete = {
+                val deletedPath = file.absolutePath
                 ScreenshotStore.delete(file)
+                analysisFieldsByPath = analysisFieldsByPath - deletedPath
+                analysisErrorByPath = analysisErrorByPath - deletedPath
+                analysisInProgressPaths = analysisInProgressPaths - deletedPath
                 selectedFile = null
                 refreshAll()
             },
@@ -277,7 +360,11 @@ private fun PermissionStatusRow(label: String, enabled: Boolean) {
 @Composable
 private fun ScreenshotItem(
     file: File,
+    extractedFields: List<AzureExtractedField>,
+    analysisError: String?,
+    isAnalyzing: Boolean,
     onOpen: () -> Unit,
+    onAnalyze: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val bitmap = remember(file.absolutePath, file.lastModified()) {
@@ -318,6 +405,63 @@ private fun ScreenshotItem(
                 }
                 Button(onClick = onDelete, modifier = Modifier.weight(1f)) {
                     Text("Delete")
+                }
+            }
+
+            Button(
+                onClick = onAnalyze,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isAnalyzing,
+            ) {
+                Text(if (isAnalyzing) "Analyzing..." else "Analyze with Azure")
+            }
+
+            if (isAnalyzing) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(18.dp),
+                        strokeWidth = 2.dp,
+                    )
+                    Text(
+                        text = "Extracting fields from screenshot",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+
+            if (analysisError != null) {
+                Text(
+                    text = analysisError,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            if (extractedFields.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = "Captured Fields",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        extractedFields.forEach { field ->
+                            val valueText = field.value.ifBlank { "-" }
+                            Text(
+                                text = "${field.name}: $valueText",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -368,6 +512,39 @@ private fun ScreenshotViewer(
                     Button(onClick = onDelete, modifier = Modifier.weight(1f)) {
                         Text("Delete")
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SavedAnalysisItem(record: ExpenseAnalysisRecord) {
+    ElevatedCard {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = DateFormat.getDateTimeInstance(
+                    DateFormat.MEDIUM,
+                    DateFormat.SHORT,
+                ).format(Date(record.savedAtMillis)),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+
+            if (record.fields.isEmpty()) {
+                Text(
+                    text = "No fields in this record",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                record.fields.forEach { (key, value) ->
+                    Text(
+                        text = "$key: ${value.ifBlank { "-" }}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
