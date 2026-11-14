@@ -3,11 +3,16 @@ package com.adityanile.expensetracker
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class ExpenseAnalysisRecord(
     val id: Long,
     val savedAtMillis: Long,
     val fields: Map<String, String>,
+    val partitionKey: String,
+    val rowKey: String,
 )
 
 object ExpenseAnalysisStore {
@@ -15,31 +20,21 @@ object ExpenseAnalysisStore {
     private const val PREF_NAME = "expense_analysis_store"
     private const val KEY_ITEMS = "items"
 
-    fun saveRecord(context: Context, fields: Map<String, String>) {
-        val existing = loadRecords(context).toMutableList()
-        existing.add(
-            0,
-            ExpenseAnalysisRecord(
-                id = System.currentTimeMillis(),
-                savedAtMillis = System.currentTimeMillis(),
-                fields = fields,
-            ),
+    fun saveRecord(context: Context, fields: Map<String, String>): ExpenseAnalysisRecord {
+        val now = System.currentTimeMillis()
+        val newRecord = ExpenseAnalysisRecord(
+            id = now,
+            savedAtMillis = now,
+            fields = fields,
+            partitionKey = partitionKeyFor(now),
+            rowKey = rowKeyFor(now, now),
         )
 
-        val payload = JSONArray()
-        existing.take(MAX_RECORDS).forEach { record ->
-            payload.put(
-                JSONObject()
-                    .put("id", record.id)
-                    .put("savedAtMillis", record.savedAtMillis)
-                    .put("fields", JSONObject(record.fields)),
-            )
-        }
+        val existing = loadRecords(context).toMutableList()
+        existing.add(0, newRecord)
+        persistRecords(context, existing.take(MAX_RECORDS))
 
-        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_ITEMS, payload.toString())
-            .apply()
+        return newRecord
     }
 
     fun loadRecords(context: Context): List<ExpenseAnalysisRecord> {
@@ -59,11 +54,16 @@ object ExpenseAnalysisStore {
                         val key = keys.next()
                         fields[key] = fieldsObject.optString(key)
                     }
+
+                    val savedAt = item.optLong("savedAtMillis", 0L)
+                    val localId = item.optLong("id", savedAt)
                     add(
                         ExpenseAnalysisRecord(
-                            id = item.optLong("id", 0L),
-                            savedAtMillis = item.optLong("savedAtMillis", 0L),
+                            id = localId,
+                            savedAtMillis = savedAt,
                             fields = fields,
+                            partitionKey = item.optString("partitionKey", partitionKeyFor(savedAt)),
+                            rowKey = item.optString("rowKey", rowKeyFor(savedAt, localId)),
                         ),
                     )
                 }
@@ -71,6 +71,42 @@ object ExpenseAnalysisStore {
         } catch (_: Throwable) {
             emptyList()
         }
+    }
+
+    fun deleteRecord(context: Context, localId: Long) {
+        val updated = loadRecords(context).filterNot { it.id == localId }
+        persistRecords(context, updated)
+    }
+
+    fun replaceAll(context: Context, records: List<ExpenseAnalysisRecord>) {
+        persistRecords(context, records.take(MAX_RECORDS))
+    }
+
+    private fun persistRecords(context: Context, records: List<ExpenseAnalysisRecord>) {
+        val payload = JSONArray()
+        records.forEach { record ->
+            payload.put(
+                JSONObject()
+                    .put("id", record.id)
+                    .put("savedAtMillis", record.savedAtMillis)
+                    .put("partitionKey", record.partitionKey)
+                    .put("rowKey", record.rowKey)
+                    .put("fields", JSONObject(record.fields)),
+            )
+        }
+
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_ITEMS, payload.toString())
+            .apply()
+    }
+
+    private fun partitionKeyFor(savedAtMillis: Long): String {
+        return SimpleDateFormat("yyyyMM", Locale.US).format(Date(savedAtMillis))
+    }
+
+    private fun rowKeyFor(savedAtMillis: Long, localId: Long): String {
+        return "$savedAtMillis-$localId"
     }
 
     private const val MAX_RECORDS = 200

@@ -207,7 +207,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         if (!settings.isConfigured()) {
             Toast.makeText(
                 applicationContext,
-                "Azure secrets missing in Gradle properties",
+                "Azure secrets missing. Add in ~/.gradle/gradle.properties, project .gradle/gradle.properties, or local.properties",
                 Toast.LENGTH_LONG,
             ).show()
             return
@@ -339,9 +339,26 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                         return@setOnClickListener
                     }
 
-                    ExpenseAnalysisStore.saveRecord(applicationContext, savedData)
+                    val savedRecord = ExpenseAnalysisStore.saveRecord(applicationContext, savedData)
                     Toast.makeText(applicationContext, "Analysis data saved", Toast.LENGTH_SHORT).show()
                     hideResultCardSafely()
+
+                    thread {
+                        val tableSettings = AzureTableSettingsProvider.fromBuildConfig()
+                        if (!tableSettings.isConfigured()) {
+                            return@thread
+                        }
+
+                        val uploadResult = AzureTableExpenseClient.upsertExpense(savedRecord, tableSettings)
+                        mainHandler.post {
+                            if (uploadResult.isSuccess) {
+                                Toast.makeText(applicationContext, "Synced to Azure Table", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val message = uploadResult.exceptionOrNull()?.message ?: "Azure Table sync failed"
+                                Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
                 }
             })
 

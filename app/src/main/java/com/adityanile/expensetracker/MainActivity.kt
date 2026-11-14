@@ -120,28 +120,82 @@ private fun MainScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
 
     var screenshots by remember { mutableStateOf(ScreenshotStore.listScreenshots(context)) }
-    var savedAnalyses by remember { mutableStateOf(ExpenseAnalysisStore.loadRecords(context)) }
+    var savedAnalyses by remember { mutableStateOf<List<ExpenseAnalysisRecord>>(emptyList()) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
     var capturePermissionReady by remember { mutableStateOf(ScreenCaptureManager.isReady()) }
     var accessibilityReady by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
     var notificationReady by remember { mutableStateOf(isNotificationPermissionGranted(context)) }
     val azureSettings = remember { AzureAnalyzerSettingsProvider.fromBuildConfig() }
+    val tableSettings = remember { AzureTableSettingsProvider.fromBuildConfig() }
+
+    var savedAnalysesLoading by remember { mutableStateOf(false) }
+    var savedAnalysesError by remember { mutableStateOf<String?>(null) }
+    var deletingRecordId by remember { mutableStateOf<Long?>(null) }
 
     var analysisFieldsByPath by remember { mutableStateOf<Map<String, List<AzureExtractedField>>>(emptyMap()) }
     var analysisErrorByPath by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var analysisInProgressPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
 
+    fun refreshSavedAnalysesFromAzure() {
+        if (!tableSettings.isConfigured()) {
+            savedAnalyses = emptyList()
+            savedAnalysesError = "Azure Table is not configured in app secrets."
+            return
+        }
+
+        savedAnalysesLoading = true
+        savedAnalysesError = null
+        thread {
+            val fetchResult = AzureTableExpenseClient.fetchExpenses(tableSettings)
+            Handler(Looper.getMainLooper()).post {
+                savedAnalysesLoading = false
+                if (fetchResult.isSuccess) {
+                    val records = fetchResult.getOrNull().orEmpty()
+                    savedAnalyses = records
+                    ExpenseAnalysisStore.replaceAll(context, records)
+                    savedAnalysesError = null
+                } else {
+                    savedAnalyses = emptyList()
+                    savedAnalysesError = fetchResult.exceptionOrNull()?.message ?: "Failed to fetch expenses from Azure Table"
+                }
+            }
+        }
+    }
+
     fun refreshAll() {
         screenshots = ScreenshotStore.listScreenshots(context)
-        savedAnalyses = ExpenseAnalysisStore.loadRecords(context)
         capturePermissionReady = ScreenCaptureManager.isReady()
         accessibilityReady = isAccessibilityServiceEnabled(context)
         notificationReady = isNotificationPermissionGranted(context)
+        refreshSavedAnalysesFromAzure()
 
         val validPaths = screenshots.map { it.absolutePath }.toSet()
         analysisFieldsByPath = analysisFieldsByPath.filterKeys { it in validPaths }
         analysisErrorByPath = analysisErrorByPath.filterKeys { it in validPaths }
         analysisInProgressPaths = analysisInProgressPaths.filter { it in validPaths }.toSet()
+    }
+
+    fun deleteSavedAnalysis(record: ExpenseAnalysisRecord) {
+        if (deletingRecordId != null) return
+
+        deletingRecordId = record.id
+        thread {
+            val deleteResult = AzureTableExpenseClient.deleteExpense(record, tableSettings)
+            Handler(Looper.getMainLooper()).post {
+                deletingRecordId = null
+                if (deleteResult.isSuccess) {
+                    ExpenseAnalysisStore.deleteRecord(context, record.id)
+                    refreshSavedAnalysesFromAzure()
+                    Toast.makeText(context, "Expense deleted", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(
+                        context,
+                        deleteResult.exceptionOrNull()?.message ?: "Failed to delete expense",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
     }
 
     fun runAnalysis(file: File) {
@@ -177,6 +231,7 @@ private fun MainScreen(
     }
 
     DisposableEffect(lifecycleOwner) {
+        refreshAll()
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 refreshAll()
@@ -244,16 +299,52 @@ private fun MainScreen(
                 )
             }
 
-            if (savedAnalyses.isEmpty()) {
-                item {
-                    Text(
-                        text = "No saved analysis records yet.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+            when {
+                savedAnalysesLoading -> {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.height(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Text(
+                                text = "Loading expenses from Azure Table...",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
-            } else {
-                items(savedAnalyses, key = { it.id }) { record ->
-                    SavedAnalysisItem(record = record)
+
+                savedAnalysesError != null -> {
+                    item {
+                        Text(
+                            text = savedAnalysesError ?: "Failed to load expenses",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+
+                savedAnalyses.isEmpty() -> {
+                    item {
+                        Text(
+                            text = "No expenses in Azure Table yet.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+
+                else -> {
+                    items(savedAnalyses, key = { it.rowKey }) { record ->
+                        SavedAnalysisItem(
+                            record = record,
+                            deleting = deletingRecordId == record.id,
+                            onDelete = { deleteSavedAnalysis(record) },
+                        )
+                    }
                 }
             }
 
@@ -519,11 +610,15 @@ private fun ScreenshotViewer(
 }
 
 @Composable
-private fun SavedAnalysisItem(record: ExpenseAnalysisRecord) {
+private fun SavedAnalysisItem(
+    record: ExpenseAnalysisRecord,
+    deleting: Boolean,
+    onDelete: () -> Unit,
+) {
     ElevatedCard {
         Column(
             modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
                 text = DateFormat.getDateTimeInstance(
@@ -545,6 +640,18 @@ private fun SavedAnalysisItem(record: ExpenseAnalysisRecord) {
                         text = "$key: ${value.ifBlank { "-" }}",
                         style = MaterialTheme.typography.bodySmall,
                     )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                Button(
+                    onClick = onDelete,
+                    enabled = !deleting,
+                ) {
+                    Text(if (deleting) "Deleting..." else "Delete")
                 }
             }
         }
