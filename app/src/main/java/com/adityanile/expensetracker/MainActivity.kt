@@ -15,19 +15,24 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -35,32 +40,41 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.adityanile.expensetracker.ui.theme.ExpenseTrackerTheme
-import java.io.File
 import java.text.DateFormat
+import java.text.NumberFormat
+import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
+import java.util.Locale
 import kotlin.concurrent.thread
+import kotlin.math.roundToLong
 
 class MainActivity : ComponentActivity() {
 
@@ -110,6 +124,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+data class DashboardSummary(
+    val totalSpent: Double,
+    val transactionCount: Int,
+    val averageSpend: Double,
+    val topCategory: String,
+    val topApp: String,
+    val categoryTotals: List<Pair<String, Double>>,
+    val appTotals: List<Pair<String, Double>>,
+    val monthlyTotals: List<Pair<String, Double>>,
+    val yearlyTotals: List<Pair<String, Double>>,
+)
+
+private enum class BreakdownType {
+    CATEGORY,
+    APP,
+    MONTH,
+    YEAR,
+}
+
+private data class BreakdownDrillDown(
+    val title: String,
+    val type: BreakdownType,
+    val key: String,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainScreen(
@@ -119,22 +158,22 @@ private fun MainScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    var screenshots by remember { mutableStateOf(ScreenshotStore.listScreenshots(context)) }
     var savedAnalyses by remember { mutableStateOf<List<ExpenseAnalysisRecord>>(emptyList()) }
-    var selectedFile by remember { mutableStateOf<File?>(null) }
     var capturePermissionReady by remember { mutableStateOf(ScreenCaptureManager.isReady()) }
     var accessibilityReady by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
     var notificationReady by remember { mutableStateOf(isNotificationPermissionGranted(context)) }
-    val azureSettings = remember { AzureAnalyzerSettingsProvider.fromBuildConfig() }
+
     val tableSettings = remember { AzureTableSettingsProvider.fromBuildConfig() }
 
     var savedAnalysesLoading by remember { mutableStateOf(false) }
     var savedAnalysesError by remember { mutableStateOf<String?>(null) }
     var deletingRecordId by remember { mutableStateOf<Long?>(null) }
+    var savingRecordId by remember { mutableStateOf<Long?>(null) }
+    var editingRecord by remember { mutableStateOf<ExpenseAnalysisRecord?>(null) }
 
-    var analysisFieldsByPath by remember { mutableStateOf<Map<String, List<AzureExtractedField>>>(emptyMap()) }
-    var analysisErrorByPath by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-    var analysisInProgressPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var selectedMonth by remember { mutableStateOf<String?>(null) }
+    var showExpenseList by remember { mutableStateOf(false) }
+    var drillDown by remember { mutableStateOf<BreakdownDrillDown?>(null) }
 
     fun refreshSavedAnalysesFromAzure() {
         if (!tableSettings.isConfigured()) {
@@ -163,20 +202,14 @@ private fun MainScreen(
     }
 
     fun refreshAll() {
-        screenshots = ScreenshotStore.listScreenshots(context)
         capturePermissionReady = ScreenCaptureManager.isReady()
         accessibilityReady = isAccessibilityServiceEnabled(context)
         notificationReady = isNotificationPermissionGranted(context)
         refreshSavedAnalysesFromAzure()
-
-        val validPaths = screenshots.map { it.absolutePath }.toSet()
-        analysisFieldsByPath = analysisFieldsByPath.filterKeys { it in validPaths }
-        analysisErrorByPath = analysisErrorByPath.filterKeys { it in validPaths }
-        analysisInProgressPaths = analysisInProgressPaths.filter { it in validPaths }.toSet()
     }
 
     fun deleteSavedAnalysis(record: ExpenseAnalysisRecord) {
-        if (deletingRecordId != null) return
+        if (deletingRecordId != null || savingRecordId != null) return
 
         deletingRecordId = record.id
         thread {
@@ -198,33 +231,26 @@ private fun MainScreen(
         }
     }
 
-    fun runAnalysis(file: File) {
-        if (!azureSettings.isConfigured()) {
-            Toast.makeText(
-                context,
-                "Azure analyzer is not configured in app secrets.",
-                Toast.LENGTH_LONG,
-            ).show()
-            return
-        }
+    fun updateSavedAnalysis(record: ExpenseAnalysisRecord, updatedFields: Map<String, String>) {
+        if (deletingRecordId != null || savingRecordId != null) return
 
-        val path = file.absolutePath
-        analysisInProgressPaths = analysisInProgressPaths + path
-        analysisErrorByPath = analysisErrorByPath - path
+        savingRecordId = record.id
+        val sanitizedFields = updatedFields.filterKeys { !ExpenseFieldRules.isExcludedFieldKey(it) }
+        val updatedRecord = record.copy(fields = sanitizedFields)
 
         thread {
-            val result = AzureContentUnderstandingClient.analyzeScreenshot(file, azureSettings)
+            val upsertResult = AzureTableExpenseClient.upsertExpense(updatedRecord, tableSettings)
             Handler(Looper.getMainLooper()).post {
-                analysisInProgressPaths = analysisInProgressPaths - path
-                if (result.isSuccess) {
-                    val fields = result.getOrNull().orEmpty()
-                    analysisFieldsByPath = analysisFieldsByPath + (path to fields)
-                    analysisErrorByPath = analysisErrorByPath - path
+                savingRecordId = null
+                if (upsertResult.isSuccess) {
+                    Toast.makeText(context, "Expense updated", Toast.LENGTH_SHORT).show()
+                    refreshSavedAnalysesFromAzure()
                 } else {
-                    analysisFieldsByPath = analysisFieldsByPath - path
-                    analysisErrorByPath = analysisErrorByPath + (
-                        path to (result.exceptionOrNull()?.message ?: "Analysis failed")
-                        )
+                    Toast.makeText(
+                        context,
+                        upsertResult.exceptionOrNull()?.message ?: "Failed to update expense",
+                        Toast.LENGTH_LONG,
+                    ).show()
                 }
             }
         }
@@ -245,10 +271,48 @@ private fun MainScreen(
 
     val setupDone = capturePermissionReady && accessibilityReady && notificationReady
 
+    val availableMonths = remember(savedAnalyses) {
+        savedAnalyses
+            .mapNotNull { record -> record.expenseMonthLabelOrNull() }
+            .distinct()
+            .sortedByDescending { monthLabel ->
+                parseMonthLabelToMillis(monthLabel) ?: Long.MIN_VALUE
+            }
+    }
+
+    LaunchedEffect(availableMonths) {
+        if (selectedMonth.isNullOrBlank() && availableMonths.isNotEmpty()) {
+            selectedMonth = availableMonths.first()
+        }
+    }
+
+    val filteredRecords = remember(savedAnalyses, selectedMonth) {
+        val scoped = if (selectedMonth.isNullOrBlank()) {
+            savedAnalyses
+        } else {
+            savedAnalyses.filter {
+                it.expenseMonthLabelOrNull() == selectedMonth
+            }
+        }
+
+        scoped.sortedByDescending { it.sortDateMillis() }
+    }
+    val dashboardSummary = remember(filteredRecords) {
+        buildDashboardSummary(filteredRecords)
+    }
+    val allTimeSummary = remember(savedAnalyses) {
+        buildDashboardSummary(savedAnalyses)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Expense Tracker") },
+                actions = {
+                    TextButton(onClick = { refreshSavedAnalysesFromAzure() }) {
+                        Text("Refresh")
+                    }
+                },
             )
         },
         modifier = Modifier.fillMaxSize(),
@@ -282,9 +346,9 @@ private fun MainScreen(
                 ) {
                     Text(
                         text = if (setupDone) {
-                            "Setup complete. Tap floating Capture button anywhere to save payment screenshots. Tap Analyze to extract fields."
+                            "Capture from overlay anytime. This dashboard gives a fast overview and detailed editable records."
                         } else {
-                            "Complete setup once. This card disappears automatically after permissions are ready."
+                            "Complete setup once. After that, only analytics and records appear here."
                         },
                         modifier = Modifier.padding(14.dp),
                         style = MaterialTheme.typography.bodyMedium,
@@ -293,106 +357,749 @@ private fun MainScreen(
             }
 
             item {
-                Text(
-                    text = "Saved Analyses",
-                    style = MaterialTheme.typography.titleMedium,
+                MonthSelectorCard(
+                    availableMonths = availableMonths,
+                    selectedMonth = selectedMonth,
+                    onSelectMonth = { selectedMonth = it },
                 )
             }
 
-            when {
-                savedAnalysesLoading -> {
-                    item {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            item {
+                DashboardOverviewCards(summary = dashboardSummary)
+            }
+
+            item {
+                SpendingBreakdownSection(
+                    summary = dashboardSummary,
+                    onCategoryClick = { category ->
+                        drillDown = BreakdownDrillDown(
+                            title = "Category: $category",
+                            type = BreakdownType.CATEGORY,
+                            key = category,
+                        )
+                    },
+                    onAppClick = { app ->
+                        drillDown = BreakdownDrillDown(
+                            title = "App: $app",
+                            type = BreakdownType.APP,
+                            key = app,
+                        )
+                    },
+                )
+            }
+
+            if (selectedMonth == null) {
+                item {
+                    TimeTrendSection(
+                        summary = allTimeSummary,
+                        onMonthClick = { month ->
+                            drillDown = BreakdownDrillDown(
+                                title = "Month: $month",
+                                type = BreakdownType.MONTH,
+                                key = month,
+                            )
+                        },
+                        onYearClick = { year ->
+                            drillDown = BreakdownDrillDown(
+                                title = "Year: $year",
+                                type = BreakdownType.YEAR,
+                                key = year,
+                            )
+                        },
+                    )
+                }
+            } else {
+                item {
+                    ElevatedCard {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.height(18.dp),
-                                strokeWidth = 2.dp,
+                            Text(
+                                text = "Time Trends",
+                                style = MaterialTheme.typography.titleSmall,
                             )
                             Text(
-                                text = "Loading expenses from Azure Table...",
+                                text = "Hidden for a single month view. Choose 'All' to see month/year trend analysis.",
                                 style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
                 }
+            }
 
-                savedAnalysesError != null -> {
-                    item {
-                        Text(
-                            text = savedAnalysesError ?: "Failed to load expenses",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.error,
-                        )
+            item {
+                ElevatedCard {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "Interactive Breakdown",
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            Text(
+                                text = "Tap any bar to view and edit matching expenses.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        if (savedAnalysesLoading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.height(20.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
                     }
                 }
+            }
 
-                savedAnalyses.isEmpty() -> {
+            item {
+                ElevatedCard {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = "All Expenses",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Text(
+                                text = "${filteredRecords.size} records for ${selectedMonth ?: "all months"}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        OutlinedButton(onClick = { showExpenseList = !showExpenseList }) {
+                            Text(if (showExpenseList) "Hide" else "View")
+                        }
+                    }
+                }
+            }
+
+            if (savedAnalysesError != null) {
+                item {
+                    Text(
+                        text = savedAnalysesError ?: "Failed to load expenses",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+
+            if (showExpenseList) {
+                if (filteredRecords.isEmpty()) {
                     item {
                         Text(
-                            text = "No expenses in Azure Table yet.",
+                            text = "No expenses found for this month.",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
-                }
-
-                else -> {
-                    items(savedAnalyses, key = { it.rowKey }) { record ->
-                        SavedAnalysisItem(
+                } else {
+                    items(filteredRecords, key = { it.rowKey }) { record ->
+                        ExpenseRecordItem(
                             record = record,
                             deleting = deletingRecordId == record.id,
+                            saving = savingRecordId == record.id,
+                            onEdit = { editingRecord = record },
                             onDelete = { deleteSavedAnalysis(record) },
                         )
                     }
                 }
             }
+        }
+    }
 
-            if (screenshots.isEmpty()) {
-                item {
-                    Text(
-                        text = "No captured screenshots yet.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
+    val drillDownRecords = remember(filteredRecords, drillDown) {
+        val active = drillDown ?: return@remember emptyList()
+        val scoped = when (active.type) {
+            BreakdownType.CATEGORY -> filteredRecords.filter {
+                it.fieldValueOrFallback("ExpenseCategory").equals(active.key, ignoreCase = true)
+            }
+
+            BreakdownType.APP -> filteredRecords.filter {
+                it.fieldValueOrFallback("PaymentApp").equals(active.key, ignoreCase = true)
+            }
+
+            BreakdownType.MONTH -> filteredRecords.filter {
+                it.expenseMonthLabelOrNull().equals(active.key, ignoreCase = true)
+            }
+
+            BreakdownType.YEAR -> filteredRecords.filter {
+                it.expenseYearLabelOrNull().equals(active.key, ignoreCase = true)
+            }
+        }
+
+        scoped.sortedByDescending { it.sortDateMillis() }
+    }
+
+    drillDown?.let { active ->
+        ExpenseDrillDownDialog(
+            title = active.title,
+            records = drillDownRecords,
+            deletingRecordId = deletingRecordId,
+            savingRecordId = savingRecordId,
+            onDismiss = { drillDown = null },
+            onEdit = { editingRecord = it },
+            onDelete = { deleteSavedAnalysis(it) },
+        )
+    }
+
+    editingRecord?.let { record ->
+        ExpenseEditDialog(
+            record = record,
+            saving = savingRecordId == record.id,
+            onDismiss = { editingRecord = null },
+            onSave = { updatedFields ->
+                editingRecord = null
+                updateSavedAnalysis(record, updatedFields)
+            },
+        )
+    }
+}
+
+@Composable
+private fun MonthSelectorCard(
+    availableMonths: List<String>,
+    selectedMonth: String?,
+    onSelectMonth: (String?) -> Unit,
+) {
+    ElevatedCard {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Choose Month",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val isAllSelected = selectedMonth == null
+                if (isAllSelected) {
+                    Button(onClick = { onSelectMonth(null) }) { Text("All") }
+                } else {
+                    OutlinedButton(onClick = { onSelectMonth(null) }) { Text("All") }
                 }
-            } else {
-                items(screenshots, key = { it.absolutePath }) { file ->
-                    val path = file.absolutePath
-                    ScreenshotItem(
-                        file = file,
-                        extractedFields = analysisFieldsByPath[path].orEmpty(),
-                        analysisError = analysisErrorByPath[path],
-                        isAnalyzing = path in analysisInProgressPaths,
-                        onOpen = { selectedFile = file },
-                        onAnalyze = { runAnalysis(file) },
-                        onDelete = {
-                            ScreenshotStore.delete(file)
-                            analysisFieldsByPath = analysisFieldsByPath - path
-                            analysisErrorByPath = analysisErrorByPath - path
-                            analysisInProgressPaths = analysisInProgressPaths - path
-                            refreshAll()
-                        },
-                    )
+
+                availableMonths.forEach { month ->
+                    val isSelected = selectedMonth == month
+                    if (isSelected) {
+                        Button(onClick = { onSelectMonth(month) }) { Text(month) }
+                    } else {
+                        OutlinedButton(onClick = { onSelectMonth(month) }) { Text(month) }
+                    }
                 }
             }
         }
     }
+}
 
-    selectedFile?.let { file ->
-        ScreenshotViewer(
-            file = file,
-            onDelete = {
-                val deletedPath = file.absolutePath
-                ScreenshotStore.delete(file)
-                analysisFieldsByPath = analysisFieldsByPath - deletedPath
-                analysisErrorByPath = analysisErrorByPath - deletedPath
-                analysisInProgressPaths = analysisInProgressPaths - deletedPath
-                selectedFile = null
-                refreshAll()
-            },
-            onClose = { selectedFile = null },
+@Composable
+private fun DashboardOverviewCards(summary: DashboardSummary) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            MetricCard(
+                title = "Total Spent",
+                value = formatCurrency(summary.totalSpent),
+                modifier = Modifier.weight(1f),
+            )
+            MetricCard(
+                title = "Transactions",
+                value = summary.transactionCount.toString(),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            MetricCard(
+                title = "Avg Expense",
+                value = formatCurrency(summary.averageSpend),
+                modifier = Modifier.weight(1f),
+            )
+            MetricCard(
+                title = "Top Category",
+                value = summary.topCategory,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        MetricCard(
+            title = "Top Payment App",
+            value = summary.topApp,
+            modifier = Modifier.fillMaxWidth(),
         )
+    }
+}
+
+@Composable
+private fun MetricCard(
+    title: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    ElevatedCard(
+        modifier = modifier,
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 16.dp)
+                .heightIn(min = 96.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SpendingBreakdownSection(
+    summary: DashboardSummary,
+    onCategoryClick: (String) -> Unit,
+    onAppClick: (String) -> Unit,
+) {
+    ElevatedCard(
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(
+                text = "Spending Breakdown",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            HorizontalAmountBars(
+                title = "By Category",
+                entries = summary.categoryTotals,
+                emptyLabel = "No category data",
+                onEntryClick = onCategoryClick,
+                maxItems = null,
+            )
+            HorizontalAmountBars(
+                title = "By Payment App",
+                entries = summary.appTotals,
+                emptyLabel = "No app data",
+                onEntryClick = onAppClick,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TimeTrendSection(
+    summary: DashboardSummary,
+    onMonthClick: (String) -> Unit,
+    onYearClick: (String) -> Unit,
+) {
+    ElevatedCard(
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 6.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(
+                text = "Time Trends",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            HorizontalAmountBars(
+                title = "Monthly",
+                entries = summary.monthlyTotals.takeLast(8),
+                emptyLabel = "No monthly trend data",
+                onEntryClick = onMonthClick,
+            )
+            HorizontalAmountBars(
+                title = "Yearly",
+                entries = summary.yearlyTotals,
+                emptyLabel = "No yearly trend data",
+                onEntryClick = onYearClick,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HorizontalAmountBars(
+    title: String,
+    entries: List<Pair<String, Double>>,
+    emptyLabel: String,
+    onEntryClick: (String) -> Unit,
+    maxItems: Int? = 6,
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+        )
+
+        if (entries.isEmpty()) {
+            Text(
+                text = emptyLabel,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            return
+        }
+
+        val visibleEntries = maxItems?.let { entries.take(it) } ?: entries
+        val totalAmount = visibleEntries.sumOf { it.second }.takeIf { it > 0.0 } ?: 1.0
+        val maxAmount = visibleEntries.maxOfOrNull { it.second }?.takeIf { it > 0.0 } ?: 1.0
+
+        val barColors = listOf(
+            MaterialTheme.colorScheme.primary,
+            MaterialTheme.colorScheme.tertiary,
+            MaterialTheme.colorScheme.secondary,
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.75f),
+            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.75f),
+            MaterialTheme.colorScheme.secondary.copy(alpha = 0.75f),
+        )
+
+        visibleEntries.forEachIndexed { index, (label, amount) ->
+            val widthFraction = (amount / maxAmount).coerceIn(0.0, 1.0).toFloat()
+            val percent = ((amount / totalAmount) * 100.0).coerceIn(0.0, 100.0)
+            val barColor = barColors[index % barColors.size]
+
+            ElevatedCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onEntryClick(label) },
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "${String.format(Locale.US, "%.1f", percent)}%",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = formatCurrency(amount),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "Tap to view",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(9.dp)
+                            .background(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(999.dp),
+                            ),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(widthFraction)
+                                .height(9.dp)
+                                .background(
+                                    color = barColor,
+                                    shape = RoundedCornerShape(999.dp),
+                                ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpenseDrillDownDialog(
+    title: String,
+    records: List<ExpenseAnalysisRecord>,
+    deletingRecordId: Long?,
+    savingRecordId: Long?,
+    onDismiss: () -> Unit,
+    onEdit: (ExpenseAnalysisRecord) -> Unit,
+    onDelete: (ExpenseAnalysisRecord) -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(12.dp)
+                    .heightIn(max = 620.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+
+                Text(
+                    text = "${records.size} expenses",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+
+                if (records.isEmpty()) {
+                    Text(
+                        text = "No matching expenses found.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f, fill = false),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(records, key = { it.rowKey }) { record ->
+                            ExpenseRecordItem(
+                                record = record,
+                                deleting = deletingRecordId == record.id,
+                                saving = savingRecordId == record.id,
+                                onEdit = { onEdit(record) },
+                                onDelete = { onDelete(record) },
+                            )
+                        }
+                    }
+                }
+
+                TextButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Close")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpenseRecordItem(
+    record: ExpenseAnalysisRecord,
+    deleting: Boolean,
+    saving: Boolean,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val amount = record.extractAmount()
+    val merchant = record.fieldValueOrFallback("MerchantName")
+    val category = record.fieldValueOrFallback("ExpenseCategory")
+    val app = record.fieldValueOrFallback("PaymentApp")
+    val paymentDate = record.displayDateTime()
+
+    ElevatedCard {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        text = merchant,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = paymentDate,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Text(
+                    text = formatCurrency(amount),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            Text(
+                text = "$category • $app",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onEdit,
+                    enabled = !deleting && !saving,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (saving) "Saving..." else "Edit")
+                }
+                Button(
+                    onClick = onDelete,
+                    enabled = !deleting && !saving,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (deleting) "Deleting..." else "Delete")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpenseEditDialog(
+    record: ExpenseAnalysisRecord,
+    saving: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (Map<String, String>) -> Unit,
+) {
+    var fieldValues by remember(record.rowKey) { mutableStateOf(record.fields) }
+
+    val orderedKeys = remember(fieldValues) {
+        val preferred = listOf(
+            "Amount",
+            "MerchantName",
+            "ExpenseCategory",
+            "PaymentApp",
+            "PaymentDateTime",
+            "ItemDescription",
+            "UpiTransactionId",
+        )
+
+        val presentPreferred = preferred.filter { key ->
+            fieldValues.keys.any { it.equals(key, ignoreCase = true) }
+        }
+        val matchedPreferredRealKeys = presentPreferred.mapNotNull { preferredKey ->
+            fieldValues.keys.firstOrNull { it.equals(preferredKey, ignoreCase = true) }
+        }
+
+        val remaining = fieldValues.keys
+            .filterNot { it in matchedPreferredRealKeys }
+            .sortedBy { it.lowercase(Locale.getDefault()) }
+
+        matchedPreferredRealKeys + remaining
+    }
+
+    Dialog(onDismissRequest = { if (!saving) onDismiss() }) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(12.dp)
+                    .heightIn(max = 540.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = "Edit Expense",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    orderedKeys.forEach { key ->
+                        OutlinedTextField(
+                            value = fieldValues[key].orEmpty(),
+                            onValueChange = { newValue ->
+                                fieldValues = fieldValues.toMutableMap().apply {
+                                    put(key, newValue)
+                                }.toMap()
+                            },
+                            label = { Text(key) },
+                            enabled = !saving,
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = key.equals("Amount", ignoreCase = true),
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        enabled = !saving,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            val cleaned = fieldValues.mapValues { (_, value) -> value.trim() }
+                            onSave(cleaned)
+                        },
+                        enabled = !saving,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(if (saving) "Saving..." else "Save")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -448,214 +1155,233 @@ private fun PermissionStatusRow(label: String, enabled: Boolean) {
     }
 }
 
-@Composable
-private fun ScreenshotItem(
-    file: File,
-    extractedFields: List<AzureExtractedField>,
-    analysisError: String?,
-    isAnalyzing: Boolean,
-    onOpen: () -> Unit,
-    onAnalyze: () -> Unit,
-    onDelete: () -> Unit,
-) {
-    val bitmap = remember(file.absolutePath, file.lastModified()) {
-        android.graphics.BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
+private fun buildDashboardSummary(records: List<ExpenseAnalysisRecord>): DashboardSummary {
+    val amountRecords = records.map { record ->
+        record to record.extractAmount()
     }
 
-    ElevatedCard {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = file.name,
-                style = MaterialTheme.typography.labelLarge,
-            )
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = file.name,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(180.dp)
-                        .background(
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            shape = RoundedCornerShape(12.dp),
-                        ),
-                    contentScale = ContentScale.Crop,
-                )
-            } else {
-                Text("Preview unavailable")
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Button(onClick = onOpen, modifier = Modifier.weight(1f)) {
-                    Text("Open")
-                }
-                Button(onClick = onDelete, modifier = Modifier.weight(1f)) {
-                    Text("Delete")
-                }
-            }
+    val totalSpent = amountRecords.sumOf { it.second }
+    val transactionCount = records.size
+    val averageSpend = if (transactionCount == 0) 0.0 else totalSpent / transactionCount
 
-            Button(
-                onClick = onAnalyze,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isAnalyzing,
-            ) {
-                Text(if (isAnalyzing) "Analyzing..." else "Analyze with Azure")
-            }
+    val categoryTotals = amountRecords
+        .groupBy { (record, _) -> record.fieldValueOrFallback("ExpenseCategory") }
+        .mapValues { (_, values) -> values.sumOf { it.second } }
+        .entries
+        .sortedByDescending { it.value }
+        .map { it.key to it.value }
 
-            if (isAnalyzing) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.height(18.dp),
-                        strokeWidth = 2.dp,
-                    )
-                    Text(
-                        text = "Extracting fields from screenshot",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
+    val appTotals = amountRecords
+        .groupBy { (record, _) -> record.fieldValueOrFallback("PaymentApp") }
+        .mapValues { (_, values) -> values.sumOf { it.second } }
+        .entries
+        .sortedByDescending { it.value }
+        .map { it.key to it.value }
 
-            if (analysisError != null) {
-                Text(
-                    text = analysisError,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
+    val monthFormatter = SimpleDateFormat("MMM yyyy", Locale.getDefault())
+    val monthKeyFormatter = SimpleDateFormat("yyyyMM", Locale.US)
+    val monthTotalsByKey = linkedMapOf<String, Double>()
 
-            if (extractedFields.isNotEmpty()) {
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    ),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Text(
-                            text = "Captured Fields",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                        extractedFields.forEach { field ->
-                            val valueText = field.value.ifBlank { "-" }
-                            Text(
-                                text = "${field.name}: $valueText",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    }
-                }
+    amountRecords.forEach { (record, amount) ->
+        val monthLabel = record.expenseMonthLabelOrNull() ?: return@forEach
+        val monthMillis = parseMonthLabelToMillis(monthLabel) ?: return@forEach
+        val key = monthKeyFormatter.format(Date(monthMillis))
+        monthTotalsByKey[key] = (monthTotalsByKey[key] ?: 0.0) + amount
+    }
+
+    val monthlyTotals = monthTotalsByKey.entries
+        .sortedBy { it.key }
+        .map { entry ->
+            val parsedDate = runCatching {
+                SimpleDateFormat("yyyyMM", Locale.US).parse(entry.key)
+            }.getOrNull()
+            val label = parsedDate?.let { monthFormatter.format(it) } ?: entry.key
+            label to entry.value
+        }
+
+    val yearTotals = amountRecords
+        .mapNotNull { (record, amount) ->
+            record.expenseYearLabelOrNull()?.let { yearLabel ->
+                yearLabel to amount
             }
         }
+        .groupBy { (yearLabel, _) -> yearLabel }
+        .mapValues { (_, values) -> values.sumOf { it.second } }
+        .entries
+        .sortedBy { it.key }
+        .map { it.key to it.value }
+
+    return DashboardSummary(
+        totalSpent = totalSpent,
+        transactionCount = transactionCount,
+        averageSpend = averageSpend,
+        topCategory = categoryTotals.firstOrNull()?.first ?: "N/A",
+        topApp = appTotals.firstOrNull()?.first ?: "N/A",
+        categoryTotals = categoryTotals,
+        appTotals = appTotals,
+        monthlyTotals = monthlyTotals,
+        yearlyTotals = yearTotals,
+    )
+}
+
+private fun ExpenseAnalysisRecord.fieldValueOrFallback(primaryKey: String): String {
+    val preferredCandidates = when (primaryKey) {
+        "Amount" -> listOf("Amount", "amount")
+        "MerchantName" -> listOf("MerchantName", "merchant_name", "merchant", "payee")
+        "ExpenseCategory" -> listOf("ExpenseCategory", "expense_category", "category")
+        "PaymentApp" -> listOf("PaymentApp", "payment_app", "app")
+        "PaymentDateTime" -> listOf("PaymentDateTime", "payment_date_time", "date", "datetime")
+        "ItemDescription" -> listOf("ItemDescription", "item_description", "description")
+        "UpiTransactionId" -> listOf("UpiTransactionId", "upi_transaction_id", "txn_id")
+        else -> listOf(primaryKey)
+    }
+
+    preferredCandidates.forEach { candidate ->
+        val hit = fields.entries.firstOrNull { it.key.equals(candidate, ignoreCase = true) }?.value
+        if (!hit.isNullOrBlank()) return hit
+    }
+
+    return "Unknown"
+}
+
+private fun ExpenseAnalysisRecord.extractAmount(): Double {
+    val raw = fieldValueOrFallback("Amount")
+    val cleaned = raw
+        .replace(Regex("[^0-9.,-]"), "")
+        .replace(",", "")
+
+    return cleaned.toDoubleOrNull() ?: 0.0
+}
+
+private fun ExpenseAnalysisRecord.displayDateTime(): String {
+    val parsed = expenseDateMillisOrNull()
+    if (parsed != null) {
+        return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(parsed))
+    }
+
+    val raw = fieldValueOrFallback("PaymentDateTime")
+    return if (!raw.equals("Unknown", ignoreCase = true) && raw.isNotBlank()) {
+        raw
+    } else {
+        "Date unavailable"
     }
 }
 
-@Composable
-private fun ScreenshotViewer(
-    file: File,
-    onDelete: () -> Unit,
-    onClose: () -> Unit,
-) {
-    val bitmap = remember(file.absolutePath, file.lastModified()) {
-        android.graphics.BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
+private fun ExpenseAnalysisRecord.expenseDateMillisOrNull(): Long? {
+    val raw = fieldValueOrFallback("PaymentDateTime")
+    if (raw.equals("Unknown", ignoreCase = true) || raw.isBlank()) {
+        return null
     }
-
-    androidx.compose.ui.window.Dialog(onDismissRequest = onClose) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text(
-                    text = file.name,
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap,
-                        contentDescription = file.name,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(320.dp),
-                        contentScale = ContentScale.Fit,
-                    )
-                } else {
-                    Text("Unable to open this screenshot")
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    TextButton(onClick = onClose, modifier = Modifier.weight(1f)) {
-                        Text("Close")
-                    }
-                    Button(onClick = onDelete, modifier = Modifier.weight(1f)) {
-                        Text("Delete")
-                    }
-                }
-            }
-        }
-    }
+    return parseFlexibleDate(raw)
 }
 
-@Composable
-private fun SavedAnalysisItem(
-    record: ExpenseAnalysisRecord,
-    deleting: Boolean,
-    onDelete: () -> Unit,
-) {
-    ElevatedCard {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = DateFormat.getDateTimeInstance(
-                    DateFormat.MEDIUM,
-                    DateFormat.SHORT,
-                ).format(Date(record.savedAtMillis)),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-            )
-
-            if (record.fields.isEmpty()) {
-                Text(
-                    text = "No fields in this record",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            } else {
-                record.fields.forEach { (key, value) ->
-                    Text(
-                        text = "$key: ${value.ifBlank { "-" }}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                Button(
-                    onClick = onDelete,
-                    enabled = !deleting,
-                ) {
-                    Text(if (deleting) "Deleting..." else "Delete")
-                }
-            }
-        }
+private fun ExpenseAnalysisRecord.expenseMonthLabelOrNull(): String? {
+    expenseDateMillisOrNull()?.let { parsed ->
+        return monthLabelFor(parsed)
     }
+
+    val raw = fieldValueOrFallback("PaymentDateTime")
+    if (raw.equals("Unknown", ignoreCase = true) || raw.isBlank()) return null
+    return parseMonthFromLooseDate(raw)
+}
+
+private fun ExpenseAnalysisRecord.expenseYearLabelOrNull(): String? {
+    expenseDateMillisOrNull()?.let { parsed ->
+        return yearLabelFor(parsed)
+    }
+
+    val raw = fieldValueOrFallback("PaymentDateTime")
+    if (raw.equals("Unknown", ignoreCase = true) || raw.isBlank()) return null
+    return parseYearFromLooseDate(raw)
+}
+
+private fun ExpenseAnalysisRecord.sortDateMillis(): Long {
+    return expenseDateMillisOrNull() ?: Long.MIN_VALUE
+}
+
+private fun parseFlexibleDate(value: String): Long? {
+    val raw = value.trim()
+    if (raw.isBlank()) return null
+
+    val normalized = raw
+        .replace(Regex("(?i)\\bon\\b"), " ")
+        .replace(Regex("(?i)sept"), "Sep")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    val formats = listOf(
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd HH:mm:ss.S",
+        "yyyy-MM-dd HH:mm",
+        "yyyy-MM-dd'T'HH:mm:ss",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+        "dd MMM yyyy, hh:mm a",
+        "dd MMM yyyy, hh:mm:ss a",
+        "dd MMMM yyyy, hh:mm a",
+        "dd MMMM yyyy, hh:mm:ss a",
+        "hh:mm a dd MMM yyyy",
+        "hh:mm:ss a dd MMM yyyy",
+        "dd MMM yyyy hh:mm a",
+        "dd MMMM yyyy hh:mm a",
+        "dd-MM-yyyy HH:mm:ss",
+        "dd/MM/yyyy HH:mm:ss",
+        "dd/MM/yyyy hh:mm a",
+        "MMM dd, yyyy hh:mm a",
+    )
+
+    formats.forEach { pattern ->
+        val parsed = runCatching {
+            SimpleDateFormat(pattern, Locale.ENGLISH).apply {
+                isLenient = false
+            }.parse(normalized)
+        }.getOrNull()
+
+        if (parsed != null) return parsed.time
+    }
+
+    return normalized.toLongOrNull()
+}
+
+private fun parseMonthLabelToMillis(label: String): Long? {
+    return runCatching {
+        SimpleDateFormat("MMM yyyy", Locale.getDefault()).apply {
+            isLenient = false
+        }.parse(label)?.time
+    }.getOrNull()
+}
+
+private fun parseMonthFromLooseDate(rawValue: String): String? {
+    val normalized = rawValue
+        .replace(Regex("(?i)sept"), "Sep")
+        .replace(Regex("(?i)\\bon\\b"), " ")
+        .replace(Regex("\\s+"), " ")
+
+    val monthYearRegex = Regex("(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\s+(20\\d{2})")
+    val match = monthYearRegex.find(normalized) ?: return null
+
+    val monthToken = match.groupValues[1].replaceFirstChar { it.uppercase() }
+    val yearToken = match.groupValues[2]
+    val monthAbbrev = monthToken.take(3)
+    return "$monthAbbrev $yearToken"
+}
+
+private fun parseYearFromLooseDate(rawValue: String): String? {
+    val yearRegex = Regex("(20\\d{2})")
+    return yearRegex.find(rawValue)?.groupValues?.getOrNull(1)
+}
+
+private fun monthLabelFor(millis: Long): String {
+    return SimpleDateFormat("MMM yyyy", Locale.getDefault()).format(Date(millis))
+}
+
+private fun yearLabelFor(millis: Long): String {
+    return Calendar.getInstance().apply { timeInMillis = millis }.get(Calendar.YEAR).toString()
+}
+
+private fun formatCurrency(value: Double): String {
+    val rounded = (value * 100.0).roundToLong() / 100.0
+    val formatter = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
+    return runCatching { formatter.format(rounded) }.getOrElse { "₹${"%.2f".format(Locale.US, rounded)}" }
 }
 
 private fun isNotificationPermissionGranted(context: android.content.Context): Boolean {

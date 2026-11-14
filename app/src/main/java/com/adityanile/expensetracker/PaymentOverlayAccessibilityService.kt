@@ -24,6 +24,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
@@ -35,6 +36,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     private var resultCardView: View? = null
     private var isProcessingCapture = false
     private var edgeState = EdgeState.RIGHT
+    private var lastForegroundPackageName: String? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -46,13 +48,21 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "Accessibility service connected")
-        scheduleOverlayRetry()
+        updateOverlayVisibilityForPackage(currentActivePackageName())
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (overlayView == null) {
-            scheduleOverlayRetry()
-        }
+        val packageName = event?.packageName
+            ?.toString()
+            ?.takeIf { it.isNotBlank() }
+
+        packageName
+            ?.takeUnless { isIgnorableForegroundPackage(it) }
+            ?.let { nonBlankPackageName ->
+                lastForegroundPackageName = nonBlankPackageName
+            }
+
+        updateOverlayVisibilityForPackage(currentActivePackageName())
     }
 
     override fun onInterrupt() {
@@ -65,12 +75,14 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     }
 
     private fun scheduleOverlayRetry() {
+        if (!shouldShowOverlayForPackage(currentActivePackageName())) return
         showOverlaySafely()
         mainHandler.postDelayed({ showOverlaySafely() }, 300)
         mainHandler.postDelayed({ showOverlaySafely() }, 1000)
     }
 
     private fun showOverlaySafely() {
+        if (!shouldShowOverlayForPackage(currentActivePackageName())) return
         if (overlayView != null) return
 
         try {
@@ -197,6 +209,29 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun updateOverlayVisibilityForPackage(packageName: String?) {
+        if (shouldShowOverlayForPackage(packageName)) {
+            if (overlayView == null) {
+                scheduleOverlayRetry()
+            }
+        } else {
+            hideOverlaySafely()
+        }
+    }
+
+    private fun shouldShowOverlayForPackage(@Suppress("UNUSED_PARAMETER") packageName: String?): Boolean {
+        return true
+    }
+
+    private fun isIgnorableForegroundPackage(packageName: String): Boolean {
+        val normalized = packageName.trim().lowercase(Locale.US)
+        if (normalized.isBlank()) return true
+        if (normalized == packageName.lowercase(Locale.US)) {
+            return normalized in TRANSIENT_SYSTEM_PACKAGES
+        }
+        return packageName.trim().lowercase(Locale.US) in TRANSIENT_SYSTEM_PACKAGES
+    }
+
     private fun triggerCaptureAndAnalyze() {
         if (isProcessingCapture) {
             Toast.makeText(applicationContext, "Processing in progress", Toast.LENGTH_SHORT).show()
@@ -212,6 +247,9 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
             ).show()
             return
         }
+
+        val capturedPackageName = currentActivePackageName()
+        val capturedAppName = resolveAppName(capturedPackageName)
 
         isProcessingCapture = true
         Toast.makeText(applicationContext, "Processing screenshot…", Toast.LENGTH_SHORT).show()
@@ -237,7 +275,11 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
 
             mainHandler.post {
                 if (analyzeResult.isSuccess) {
-                    showEditableFieldsCard(analyzeResult.getOrNull().orEmpty())
+                    val enrichedFields = mergePaymentAppField(
+                        fields = analyzeResult.getOrNull().orEmpty(),
+                        appName = capturedAppName,
+                    )
+                    showEditableFieldsCard(enrichedFields)
                 } else {
                     val message = analyzeResult.exceptionOrNull()?.message ?: "Azure analysis failed"
                     Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
@@ -248,6 +290,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
 
     private fun showEditableFieldsCard(fields: List<AzureExtractedField>) {
         val editableValues = linkedMapOf<String, EditText>()
+        val filteredFields = fields.filterNot { ExpenseFieldRules.isExcludedFieldKey(it.name) }
 
         val scrollContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -259,7 +302,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                 textSize = 17f
             })
 
-            if (fields.isEmpty()) {
+            if (filteredFields.isEmpty()) {
                 addView(TextView(context).apply {
                     text = "No fields extracted"
                     setTextColor(Color.argb(220, 186, 186, 186))
@@ -267,7 +310,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                     setPadding(0, dp(8), 0, dp(10))
                 })
             } else {
-                fields.forEach { field ->
+                filteredFields.forEach { field ->
                     val fieldContainer = LinearLayout(context).apply {
                         orientation = LinearLayout.VERTICAL
                         background = GradientDrawable().apply {
@@ -332,6 +375,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
                 setOnClickListener {
                     val savedData = editableValues
                         .mapValues { (_, value) -> value.text?.toString().orEmpty().trim() }
+                        .filterKeys { key -> !ExpenseFieldRules.isExcludedFieldKey(key) }
                         .filterValues { it.isNotBlank() }
 
                     if (savedData.isEmpty()) {
@@ -372,6 +416,81 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         }
 
         showCard(scrollView)
+    }
+
+    private fun currentActivePackageName(): String? {
+        val fromRoot = rootInActiveWindow?.packageName
+            ?.toString()
+            ?.takeIf { it.isNotBlank() }
+            ?.takeUnless { isIgnorableForegroundPackage(it) }
+
+        return fromRoot ?: lastForegroundPackageName
+    }
+
+    private fun resolveAppName(packageName: String?): String? {
+        val safePackage = packageName?.takeIf { it.isNotBlank() } ?: return null
+
+        val mappedName = KNOWN_APP_NAMES[safePackage]
+        if (!mappedName.isNullOrBlank()) return mappedName
+
+        val label = runCatching {
+            val appInfo = packageManager.getApplicationInfo(safePackage, 0)
+            packageManager.getApplicationLabel(appInfo).toString()
+        }.getOrNull()?.trim()
+
+        if (!label.isNullOrBlank() && !isGenericAppLabel(label)) {
+            return label
+        }
+
+        return prettifyPackageName(safePackage)
+    }
+
+    private fun isGenericAppLabel(label: String): Boolean {
+        val normalized = label.trim().lowercase(Locale.US)
+        return normalized in setOf("user", "app", "application", "android")
+    }
+
+    private fun prettifyPackageName(packageName: String): String {
+        val segments = packageName.split('.')
+            .filter { it.isNotBlank() }
+            .filterNot { it in setOf("com", "org", "net", "android", "apps", "google") }
+
+        val preferred = segments.firstOrNull { segment ->
+            val normalized = segment.lowercase(Locale.US)
+            normalized !in setOf("user", "app", "application")
+        } ?: packageName.substringAfterLast('.')
+
+        return preferred.replace('_', ' ').replace('-', ' ')
+            .replaceFirstChar { char ->
+                if (char.isLowerCase()) char.titlecase(Locale.US) else char.toString()
+            }
+    }
+
+    private fun mergePaymentAppField(
+        fields: List<AzureExtractedField>,
+        appName: String?,
+    ): List<AzureExtractedField> {
+        val safeAppName = appName?.trim().orEmpty()
+        if (safeAppName.isBlank()) return fields
+
+        val mutable = fields.toMutableList()
+        val existingIndex = mutable.indexOfFirst { it.name.equals("PaymentApp", ignoreCase = true) }
+
+        if (existingIndex >= 0) {
+            val existing = mutable[existingIndex]
+            mutable[existingIndex] = existing.copy(value = safeAppName)
+        } else {
+            mutable.add(
+                0,
+                AzureExtractedField(
+                    name = "PaymentApp",
+                    value = safeAppName,
+                    confidence = null,
+                ),
+            )
+        }
+
+        return mutable
     }
 
     private fun showCard(contentView: View) {
@@ -501,6 +620,19 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         private const val IDLE_DELAY_MS = 2000L
         private const val ACTIVE_ALPHA = 0.98f
         private const val IDLE_ALPHA = 0.55f
+
+        private val TRANSIENT_SYSTEM_PACKAGES = setOf(
+            "android",
+            "com.android.systemui",
+            "com.google.android.permissioncontroller",
+            "com.google.android.packageinstaller",
+        )
+
+        private val KNOWN_APP_NAMES = mapOf(
+            "com.google.android.apps.nbu.paisa.user" to "Google Pay",
+            "com.phonepe.app" to "PhonePe",
+            "com.phonepe.app.business" to "PhonePe Business",
+        )
     }
 
     private enum class EdgeState {

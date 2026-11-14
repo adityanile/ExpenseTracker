@@ -12,6 +12,14 @@ import java.util.TimeZone
 
 object AzureTableExpenseClient {
 
+    private data class TableRequestResult(
+        val responseCode: Int,
+        val responseText: String,
+    ) {
+        val isSuccess: Boolean
+            get() = responseCode in 200..299
+    }
+
     fun upsertExpense(
         record: ExpenseAnalysisRecord,
         settings: AzureTableSettings,
@@ -20,11 +28,54 @@ object AzureTableExpenseClient {
             return Result.failure(IllegalStateException("Azure Table settings are incomplete."))
         }
 
-        return requestWithBody(
+        val payload = buildEntityPayload(record)
+
+        val insertResult = requestWithBody(
             method = "POST",
             requestUrl = buildEntitiesUrl(settings),
-            body = buildEntityPayload(record),
+            body = payload,
         )
+
+        if (insertResult.isSuccess) {
+            return Result.success(Unit)
+        }
+
+        if (insertResult.responseCode != HttpURLConnection.HTTP_CONFLICT) {
+            return Result.failure(
+                IllegalStateException(
+                    "Azure Table insert failed (${insertResult.responseCode}): ${insertResult.responseText.ifBlank { "No response body" }}",
+                ),
+            )
+        }
+
+        val partitionKey = payload.optString("PartitionKey")
+        val rowKey = payload.optString("RowKey")
+        if (partitionKey.isBlank() || rowKey.isBlank()) {
+            return Result.failure(IllegalStateException("Missing entity keys for update."))
+        }
+
+        val replaceUrl = buildSingleEntityUrl(
+            settings = settings,
+            partitionKey = partitionKey,
+            rowKey = rowKey,
+        )
+
+        val replaceResult = requestWithBody(
+            method = "PUT",
+            requestUrl = replaceUrl,
+            body = payload,
+            ifMatch = "*",
+        )
+
+        return if (replaceResult.isSuccess) {
+            Result.success(Unit)
+        } else {
+            Result.failure(
+                IllegalStateException(
+                    "Azure Table update failed (${replaceResult.responseCode}): ${replaceResult.responseText.ifBlank { "No response body" }}",
+                ),
+            )
+        }
     }
 
     fun fetchExpenses(settings: AzureTableSettings): Result<List<ExpenseAnalysisRecord>> {
@@ -68,9 +119,9 @@ object AzureTableExpenseClient {
                     val keys = item.keys()
                     while (keys.hasNext()) {
                         val key = keys.next()
-                        if (key in RESERVED_KEYS) continue
+                        if (key in RESERVED_KEYS || ExpenseFieldRules.isExcludedFieldKey(key)) continue
                         val raw = item.opt(key)
-                        fields[key] = normalizeValue(raw)
+                        fields[key] = normalizeFieldValue(key, normalizeValue(raw))
                     }
 
                     add(
@@ -85,7 +136,7 @@ object AzureTableExpenseClient {
                 }
             }
 
-            Result.success(records.sortedByDescending { it.savedAtMillis })
+            Result.success(records)
         } catch (error: Throwable) {
             Result.failure(error)
         }
@@ -142,7 +193,8 @@ object AzureTableExpenseClient {
         method: String,
         requestUrl: String,
         body: JSONObject,
-    ): Result<Unit> {
+        ifMatch: String? = null,
+    ): TableRequestResult {
         return try {
             val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
@@ -153,6 +205,9 @@ object AzureTableExpenseClient {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("x-ms-date", rfc1123Now())
                 setRequestProperty("x-ms-version", "2023-11-03")
+                if (!ifMatch.isNullOrBlank()) {
+                    setRequestProperty("If-Match", ifMatch)
+                }
             }
 
             connection.outputStream.use { output ->
@@ -162,18 +217,12 @@ object AzureTableExpenseClient {
             val responseCode = connection.responseCode
             val responseText = readBody(connection)
             connection.disconnect()
-
-            if (responseCode in 200..299) {
-                Result.success(Unit)
-            } else {
-                Result.failure(
-                    IllegalStateException(
-                        "Azure Table request failed ($responseCode): ${responseText.ifBlank { "No response body" }}",
-                    ),
-                )
-            }
+            TableRequestResult(responseCode = responseCode, responseText = responseText)
         } catch (error: Throwable) {
-            Result.failure(error)
+            TableRequestResult(
+                responseCode = -1,
+                responseText = error.message ?: "Unexpected request error",
+            )
         }
     }
 
@@ -196,7 +245,8 @@ object AzureTableExpenseClient {
             put("SavedAtMillis", record.savedAtMillis)
             put("LocalId", record.id)
             record.fields.forEach { (key, value) ->
-                put(sanitizePropertyName(key), value)
+                if (ExpenseFieldRules.isExcludedFieldKey(key)) return@forEach
+                put(sanitizePropertyName(key), normalizeFieldValue(key, value))
             }
         }
     }
@@ -242,6 +292,53 @@ object AzureTableExpenseClient {
             null, JSONObject.NULL -> ""
             else -> value.toString()
         }
+    }
+
+    private fun normalizeFieldValue(key: String, value: String): String {
+        if (ExpenseFieldRules.isExcludedFieldKey(key)) return ""
+        if (!isPaymentDateTimeKey(key)) return value
+        return normalizePaymentDateTime(value)
+    }
+
+    private fun isPaymentDateTimeKey(key: String): Boolean {
+        val normalized = key.replace("_", "")
+        return normalized.equals("PaymentDateTime", ignoreCase = true)
+    }
+
+    private fun normalizePaymentDateTime(input: String): String {
+        val raw = input.trim()
+        if (raw.isBlank()) return raw
+
+        val normalizedInput = raw
+            .replace(Regex("(?i)\\bon\\b"), " ")
+            .replace(Regex("(?i)sept"), "Sep")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        val patterns = listOf(
+            "dd MMM yyyy, hh:mm a",
+            "hh:mm a dd MMM yyyy",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd HH:mm",
+            "dd-MM-yyyy HH:mm:ss",
+            "dd/MM/yyyy HH:mm:ss",
+            "dd/MM/yyyy hh:mm a",
+            "dd MMM yyyy, hh:mm:ss a",
+            "dd MMM yyyy hh:mm a",
+            "MMM dd, yyyy hh:mm a",
+        )
+
+        val parsedDate = patterns.firstNotNullOfOrNull { pattern ->
+            runCatching {
+                SimpleDateFormat(pattern, Locale.ENGLISH).apply {
+                    isLenient = false
+                }.parse(normalizedInput)
+            }.getOrNull()
+        } ?: return raw
+
+        return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(parsedDate)
     }
 
     private fun rfc1123Now(): String {
