@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -79,6 +80,7 @@ import kotlin.math.roundToLong
 class MainActivity : ComponentActivity() {
 
     private lateinit var mediaProjectionManager: MediaProjectionManager
+    private var sharedReceiptPayload by mutableStateOf<SharedReceiptPayload?>(null)
 
     private val screenCaptureLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -99,6 +101,7 @@ class MainActivity : ComponentActivity() {
             ?: error("MediaProjectionManager unavailable")
 
         requestNotificationPermissionIfNeeded()
+        sharedReceiptPayload = intent.toSharedReceiptPayload(packageManager)
 
         setContent {
             ExpenseTrackerTheme {
@@ -109,9 +112,17 @@ class MainActivity : ComponentActivity() {
                     onGrantCaptureClick = {
                         screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
                     },
+                    incomingSharedReceipt = sharedReceiptPayload,
+                    onSharedReceiptHandled = { sharedReceiptPayload = null },
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        sharedReceiptPayload = intent.toSharedReceiptPayload(packageManager)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -149,11 +160,20 @@ private data class BreakdownDrillDown(
     val key: String,
 )
 
+private data class SharedReceiptPayload(
+    val imageUri: Uri,
+    val sourcePackageName: String?,
+    val sourceAppName: String?,
+    val requestId: Long,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainScreen(
     onEnableAccessibilityClick: () -> Unit,
     onGrantCaptureClick: () -> Unit,
+    incomingSharedReceipt: SharedReceiptPayload?,
+    onSharedReceiptHandled: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -174,6 +194,10 @@ private fun MainScreen(
     var selectedMonth by remember { mutableStateOf<String?>(null) }
     var showExpenseList by remember { mutableStateOf(false) }
     var drillDown by remember { mutableStateOf<BreakdownDrillDown?>(null) }
+
+    var sharedReceiptProcessing by remember { mutableStateOf(false) }
+    var sharedReceiptSaving by remember { mutableStateOf(false) }
+    var sharedReceiptEditableFields by remember { mutableStateOf<Map<String, String>?>(null) }
 
     fun refreshSavedAnalysesFromAzure() {
         if (!tableSettings.isConfigured()) {
@@ -249,6 +273,62 @@ private fun MainScreen(
                     Toast.makeText(
                         context,
                         upsertResult.exceptionOrNull()?.message ?: "Failed to update expense",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(incomingSharedReceipt?.requestId) {
+        val payload = incomingSharedReceipt ?: return@LaunchedEffect
+        onSharedReceiptHandled()
+
+        val settings = AzureOpenAiSettingsProvider.fromBuildConfig()
+        if (!settings.isConfigured()) {
+            Toast.makeText(context, "Azure OpenAI settings are missing", Toast.LENGTH_LONG).show()
+            return@LaunchedEffect
+        }
+
+        sharedReceiptProcessing = true
+        Toast.makeText(context, "Analyzing shared receipt…", Toast.LENGTH_SHORT).show()
+
+        thread {
+            val imageBytesResult = runCatching {
+                context.contentResolver.openInputStream(payload.imageUri)?.use { stream ->
+                    stream.readBytes()
+                } ?: error("Unable to read shared image")
+            }
+
+            if (imageBytesResult.isFailure) {
+                Handler(Looper.getMainLooper()).post {
+                    sharedReceiptProcessing = false
+                    Toast.makeText(
+                        context,
+                        imageBytesResult.exceptionOrNull()?.message ?: "Failed to read shared image",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return@thread
+            }
+
+            val analyzeResult = AzureOpenAiExpenseClient.analyzeImageBytes(
+                imageBytes = imageBytesResult.getOrThrow(),
+                settings = settings,
+            )
+
+            Handler(Looper.getMainLooper()).post {
+                sharedReceiptProcessing = false
+                if (analyzeResult.isSuccess) {
+                    sharedReceiptEditableFields = toEditableFieldMap(
+                        fields = analyzeResult.getOrNull().orEmpty(),
+                        sourceAppName = payload.sourceAppName,
+                        sourcePackageName = payload.sourcePackageName,
+                    )
+                } else {
+                    Toast.makeText(
+                        context,
+                        analyzeResult.exceptionOrNull()?.message ?: "Failed to analyze shared image",
                         Toast.LENGTH_LONG,
                     ).show()
                 }
@@ -568,6 +648,63 @@ private fun MainScreen(
             onSave = { updatedFields ->
                 editingRecord = null
                 updateSavedAnalysis(record, updatedFields)
+            },
+        )
+    }
+
+    sharedReceiptEditableFields?.let { editableFields ->
+        val draftRecord = ExpenseAnalysisRecord(
+            id = -1,
+            savedAtMillis = System.currentTimeMillis(),
+            fields = editableFields,
+            partitionKey = "",
+            rowKey = "shared-receipt-draft",
+        )
+
+        ExpenseEditDialog(
+            record = draftRecord,
+            saving = sharedReceiptSaving,
+            onDismiss = {
+                if (!sharedReceiptSaving) {
+                    sharedReceiptEditableFields = null
+                }
+            },
+            onSave = { updatedFields ->
+                val cleaned = updatedFields
+                    .filterKeys { key -> !ExpenseFieldRules.isExcludedFieldKey(key) }
+                    .mapValues { (_, value) -> value.trim() }
+                    .filterValues { it.isNotBlank() }
+
+                if (cleaned.isEmpty()) {
+                    Toast.makeText(context, "Nothing to save", Toast.LENGTH_SHORT).show()
+                    return@ExpenseEditDialog
+                }
+
+                if (!tableSettings.isConfigured()) {
+                    Toast.makeText(context, "Azure Table settings are missing", Toast.LENGTH_LONG).show()
+                    return@ExpenseEditDialog
+                }
+
+                sharedReceiptSaving = true
+                thread {
+                    val savedRecord = ExpenseAnalysisStore.saveRecord(context, cleaned)
+                    val upsertResult = AzureTableExpenseClient.upsertExpense(savedRecord, tableSettings)
+
+                    Handler(Looper.getMainLooper()).post {
+                        sharedReceiptSaving = false
+                        if (upsertResult.isSuccess) {
+                            sharedReceiptEditableFields = null
+                            Toast.makeText(context, "Shared expense saved", Toast.LENGTH_SHORT).show()
+                            refreshSavedAnalysesFromAzure()
+                        } else {
+                            Toast.makeText(
+                                context,
+                                upsertResult.exceptionOrNull()?.message ?: "Failed to save shared expense",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                }
             },
         )
     }
@@ -1153,6 +1290,155 @@ private fun PermissionStatusRow(label: String, enabled: Boolean) {
         Text(text = label, style = MaterialTheme.typography.bodyMedium)
         Text(text = statusText, color = statusColor, style = MaterialTheme.typography.labelLarge)
     }
+}
+
+private fun toEditableFieldMap(
+    fields: List<AzureExtractedField>,
+    sourceAppName: String?,
+    sourcePackageName: String?,
+): Map<String, String> {
+    val filtered = linkedMapOf<String, String>()
+    fields.forEach { field ->
+        if (!ExpenseFieldRules.isExcludedFieldKey(field.name)) {
+            filtered[field.name] = field.value
+        }
+    }
+
+    val safeApp = sourceAppName
+        ?.trim()
+        ?.takeIf { it.isNotBlank() && !isGenericAppName(it) }
+        ?: inferAppNameFromPackageName(sourcePackageName)
+        ?: ""
+    if (safeApp.isNotBlank()) {
+        val paymentAppKey = filtered.keys.firstOrNull { key -> key.equals("PaymentApp", ignoreCase = true) }
+        if (paymentAppKey == null) {
+            val withApp = linkedMapOf<String, String>()
+            withApp["PaymentApp"] = safeApp
+            withApp.putAll(filtered)
+            return withApp
+        }
+        filtered[paymentAppKey] = safeApp
+    }
+
+    return filtered
+}
+
+private fun Intent.toSharedReceiptPayload(packageManager: PackageManager): SharedReceiptPayload? {
+    if (action != Intent.ACTION_SEND) return null
+    val intentType = type.orEmpty()
+    if (!intentType.startsWith("image/")) return null
+
+    val imageUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+    } ?: clipData?.getItemAt(0)?.uri ?: return null
+
+    val sourcePackage = resolveShareSourcePackage() ?: inferPackageFromUriAuthority(imageUri)
+    val sourceAppName = resolveShareSourceAppName(
+        packageManager = packageManager,
+        sourcePackage = sourcePackage,
+    ) ?: inferAppNameFromPackageName(sourcePackage)
+
+    return SharedReceiptPayload(
+        imageUri = imageUri,
+        sourcePackageName = sourcePackage,
+        sourceAppName = sourceAppName,
+        requestId = System.currentTimeMillis(),
+    )
+}
+
+private fun Intent.resolveShareSourcePackage(): String? {
+    val referrerName = getStringExtra(Intent.EXTRA_REFERRER_NAME)
+    val referrerPackage = runCatching {
+        Uri.parse(referrerName).takeIf { it.scheme == "android-app" }?.host
+    }.getOrNull()
+
+    val extraPackage = extras?.getString("android.intent.extra.PACKAGE_NAME")
+    val chooserPackage = extras?.getString(Intent.EXTRA_CHOSEN_COMPONENT)
+    return referrerPackage ?: extraPackage ?: chooserPackage
+}
+
+private fun resolveShareSourceAppName(
+    packageManager: PackageManager,
+    sourcePackage: String?,
+): String? {
+    val candidatePackages = listOfNotNull(
+        sourcePackage,
+        sourcePackage?.substringBeforeLast(".fileprovider"),
+        sourcePackage?.substringBeforeLast(".provider"),
+    )
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+
+    candidatePackages.forEach { candidate ->
+        val label = runCatching {
+            val appInfo = packageManager.getApplicationInfo(candidate, 0)
+            packageManager.getApplicationLabel(appInfo).toString().trim()
+        }.getOrNull()
+
+        if (!label.isNullOrBlank() && !isGenericAppName(label)) {
+            return label
+        }
+    }
+
+    return null
+}
+
+private fun inferPackageFromUriAuthority(uri: Uri): String? {
+    val authority = uri.authority?.trim().orEmpty()
+    if (authority.isBlank()) return null
+
+    val providerSuffixes = listOf(
+        ".fileprovider",
+        ".provider",
+        ".contentprovider",
+        ".files",
+        ".documents",
+    )
+
+    val normalized = providerSuffixes.firstNotNullOfOrNull { suffix ->
+        authority.takeIf { it.endsWith(suffix, ignoreCase = true) }?.removeSuffix(suffix)
+    } ?: authority
+
+    return normalized.takeIf { it.contains('.') }
+}
+
+private fun inferAppNameFromPackageName(packageName: String?): String? {
+    val safePackage = packageName?.trim()?.lowercase(Locale.US).orEmpty()
+    if (safePackage.isBlank()) return null
+
+    val known = when {
+        safePackage.contains("phonepe") -> "PhonePe"
+        safePackage.contains("paisa.user") || safePackage.contains("google") && safePackage.contains("pay") -> "Google Pay"
+        safePackage.contains("paytm") -> "Paytm"
+        safePackage.contains("bhim") -> "BHIM"
+        safePackage.contains("mobikwik") -> "MobiKwik"
+        safePackage.contains("cred") -> "CRED"
+        safePackage.contains("amazon") && safePackage.contains("pay") -> "Amazon Pay"
+        else -> null
+    }
+
+    if (!known.isNullOrBlank()) return known
+
+    val segment = safePackage
+        .split('.')
+        .asReversed()
+        .firstOrNull { token -> token.isNotBlank() && token !in setOf("app", "android", "provider", "fileprovider", "files") }
+        ?: return null
+
+    return segment.replace('_', ' ').replace('-', ' ')
+        .replaceFirstChar { character ->
+            if (character.isLowerCase()) character.titlecase(Locale.US) else character.toString()
+        }
+        .takeIf { !isGenericAppName(it) }
+}
+
+private fun isGenericAppName(value: String): Boolean {
+    val normalized = value.trim().lowercase(Locale.US)
+    return normalized.isBlank() || normalized in setOf("unknown", "user", "app", "application", "android")
 }
 
 private fun buildDashboardSummary(records: List<ExpenseAnalysisRecord>): DashboardSummary {
