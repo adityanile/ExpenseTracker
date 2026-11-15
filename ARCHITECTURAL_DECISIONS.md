@@ -28,3 +28,32 @@ Use Azure OpenAI REST API with the deployed `gpt-4.1-mini` model for structured 
 ### Consequences
 - Better end-user reliability and less app-to-app variance in extracted fields.
 - Higher but acceptable operational cost profile for the current personal-use scope.
+
+## ADR-002: Quick Settings Tile controls Accessibility Service state for payment compatibility
+- **Date:** 2026-11-15
+- **Status:** Accepted
+
+### Context
+Several payment apps (for example, Google Pay) can block transaction confirmation when a third-party Accessibility Service is active.
+
+The previous toggle only hid the overlay bubble, but the Accessibility Service process remained enabled. This did not satisfy anti-fraud checks in many payment flows.
+
+### Decision
+Implement an Android Quick Settings tile as the primary runtime control for the capture feature:
+- When tile is tapped in active state, disable the capture service by sending an app-local broadcast and calling `disableSelf()` from `PaymentOverlayAccessibilityService`.
+- Persist overlay preference state in shared preferences (`OverlayTogglePreferences`) so service behavior remains consistent.
+- When tile is tapped in inactive state, open Accessibility Settings to let the user explicitly re-enable the service.
+
+### Rationale
+- Payment compatibility depends on service state, not only overlay visibility.
+- Quick Settings provides the fastest user path before/after checkout.
+- Re-enable flow through system settings keeps user consent explicit and platform-compliant.
+
+### Trade-offs
+- Re-enabling is not one-tap due to Android security model for Accessibility Services.
+- Users need to learn a small workflow: disable before payment, re-enable after payment.
+
+### Consequences
+- Fewer payment blocks caused by the app during sensitive checkout flows.
+- Slightly higher UX friction after payment when restoring capture mode.
+- Architecture now separates "overlay visibility" preference from actual "service enabled" system state.

@@ -2,6 +2,10 @@ package com.adityanile.expensetracker
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -23,6 +27,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import kotlin.concurrent.thread
@@ -38,6 +43,22 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     private var edgeState = EdgeState.RIGHT
     private var lastForegroundPackageName: String? = null
 
+    private val overlayToggleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                OverlayTogglePreferences.ACTION_OVERLAY_TOGGLE_CHANGED -> {
+                    updateOverlayVisibilityForPackage(currentActivePackageName())
+                }
+
+                OverlayTogglePreferences.ACTION_DISABLE_ACCESSIBILITY_SERVICE -> {
+                    OverlayTogglePreferences.setOverlayEnabled(this@PaymentOverlayAccessibilityService, enabled = false)
+                    hideOverlaySafely()
+                    disableSelf()
+                }
+            }
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         serviceInfo = serviceInfo.apply {
@@ -48,6 +69,8 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "Accessibility service connected")
+        OverlayTogglePreferences.setOverlayEnabled(this, enabled = true)
+        registerOverlayToggleReceiver()
         updateOverlayVisibilityForPackage(currentActivePackageName())
     }
 
@@ -70,6 +93,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        unregisterOverlayToggleReceiver()
         hideOverlaySafely()
         super.onDestroy()
     }
@@ -220,7 +244,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
     }
 
     private fun shouldShowOverlayForPackage(@Suppress("UNUSED_PARAMETER") packageName: String?): Boolean {
-        return true
+        return OverlayTogglePreferences.isOverlayEnabled(this)
     }
 
     private fun isIgnorableForegroundPackage(packageName: String): Boolean {
@@ -613,6 +637,23 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
             value.toFloat(),
             resources.displayMetrics,
         ).toInt()
+    }
+
+    private fun registerOverlayToggleReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(OverlayTogglePreferences.ACTION_OVERLAY_TOGGLE_CHANGED)
+            addAction(OverlayTogglePreferences.ACTION_DISABLE_ACCESSIBILITY_SERVICE)
+        }
+        ContextCompat.registerReceiver(
+            this,
+            overlayToggleReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
+
+    private fun unregisterOverlayToggleReceiver() {
+        runCatching { unregisterReceiver(overlayToggleReceiver) }
     }
 
     companion object {
