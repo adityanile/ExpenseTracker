@@ -9,7 +9,7 @@ You **do not need to share receipt images into the app**.
 
 Instead:
 1. Use the floating overlay capture button while using payment apps.
-2. The screenshot is analyzed by **Azure Content Understanding**.
+2. The screenshot is analyzed by **Azure OpenAI (GPT-4.1-mini)**.
 3. Extracted fields are shown back to you for validation/editing.
 4. Final expense data is stored in your own **Azure Storage Account (Azure Tables)** for long-term persistence.
 5. Open the app mainly to view beautiful analytics and manage expenses.
@@ -19,7 +19,7 @@ Instead:
 ## ✨ Core Capabilities
 - Floating, draggable overlay capture button (Accessibility Service based)
 - One-tap screenshot capture from foreground screen context
-- AI extraction using Azure Content Understanding analyzer
+- AI extraction using Azure OpenAI Responses API (GPT-4.1-mini deployment)
 - Editable confirmation card before final save
 - Azure Table Storage as long-term source of truth
 - Dashboard with:
@@ -36,7 +36,7 @@ Instead:
 1. `PaymentOverlayAccessibilityService` shows overlay.
 2. Tap capture button.
 3. `ScreenCaptureManager` captures screenshot via MediaProjection service.
-4. `AzureContentUnderstandingClient` sends image bytes to your analyzer.
+4. `AzureOpenAiExpenseClient` sends image bytes to your deployed model.
 5. Extracted fields are merged/validated in overlay card.
 6. Data is persisted to Azure Tables through `AzureTableExpenseClient`.
 7. App UI fetches from Azure and renders dashboard + expense lists.
@@ -47,7 +47,7 @@ Instead:
 - Kotlin + Jetpack Compose
 - Accessibility Service + Overlay Window
 - MediaProjection + Foreground Service for screenshot capture
-- Azure AI Content Understanding REST API
+- Azure OpenAI Responses REST API
 - Azure Table Storage REST API
 - Material 3 UI
 
@@ -62,10 +62,9 @@ This project reads secrets in the following priority order:
 Add these keys (recommended in **`.gradle/gradle.properties`**, not committed):
 
 ```properties
-AZURE_CONTENT_UNDERSTANDING_ENDPOINT=https://<your-resource>.services.ai.azure.com/
-AZURE_CONTENT_UNDERSTANDING_KEY=<your-content-understanding-key>
-AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID=expenseanalyser
-AZURE_CONTENT_UNDERSTANDING_API_VERSION=2025-11-01
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.services.ai.azure.com/openai/v1
+AZURE_OPENAI_API_KEY=<your-azure-openai-key>
+AZURE_OPENAI_MODEL=gpt-4.1-mini
 
 AZURE_TABLE_ENDPOINT=https://<your-storage-account>.table.core.windows.net
 AZURE_TABLE_NAME=<your-table-name>
@@ -118,9 +117,9 @@ Excluded fields (current rule):
 - `app/src/main/java/com/adityanile/expensetracker/MainActivity.kt`
 - `app/src/main/java/com/adityanile/expensetracker/PaymentOverlayAccessibilityService.kt`
 - `app/src/main/java/com/adityanile/expensetracker/ScreenCaptureManager.kt`
-- `app/src/main/java/com/adityanile/expensetracker/AzureContentUnderstandingClient.kt`
+- `app/src/main/java/com/adityanile/expensetracker/AzureOpenAiExpenseClient.kt`
 - `app/src/main/java/com/adityanile/expensetracker/AzureTableExpenseClient.kt`
-- `app/src/main/java/com/adityanile/expensetracker/AzureAnalyzerSettings.kt`
+- `app/src/main/java/com/adityanile/expensetracker/AzureOpenAiSettings.kt`
 - `app/src/main/java/com/adityanile/expensetracker/AzureTableSettings.kt`
 
 ---
@@ -128,7 +127,7 @@ Excluded fields (current rule):
 ## 📌 Current Product Positioning
 ExpenseTracker is designed as an **AI-assisted background expense capture system**:
 - Capture happens from overlay (without opening app flows).
-- Intelligence comes from Azure Content Understanding.
+- Intelligence comes from Azure OpenAI model inference.
 - Trust comes from user validation before save.
 - Durability comes from your own Azure Table Storage.
 - Insight comes from an interactive expense analytics dashboard.

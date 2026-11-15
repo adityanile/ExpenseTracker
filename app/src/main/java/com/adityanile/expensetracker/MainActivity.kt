@@ -1316,6 +1316,8 @@ private fun parseFlexibleDate(value: String): Long? {
         "yyyy-MM-dd'T'HH:mm:ss",
         "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
         "dd MMM yyyy, hh:mm a",
+        "dd MMM yyyy, h:mma",
+        "dd MMM yyyy, hh:mma",
         "dd MMM yyyy, hh:mm:ss a",
         "dd MMMM yyyy, hh:mm a",
         "dd MMMM yyyy, hh:mm:ss a",

@@ -36,10 +36,18 @@ android {
         }
     }
 
-    val azureEndpoint = resolveSecret("AZURE_CONTENT_UNDERSTANDING_ENDPOINT")
-    val azureKey = resolveSecret("AZURE_CONTENT_UNDERSTANDING_KEY")
-    val azureAnalyzerId = resolveSecret("AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID", "expenseanalyser")
-    val azureApiVersion = resolveSecret("AZURE_CONTENT_UNDERSTANDING_API_VERSION", "2025-11-01")
+    val azureOpenAiEndpoint = resolveSecret(
+        "AZURE_OPENAI_ENDPOINT",
+        resolveSecret("AZURE_CONTENT_UNDERSTANDING_ENDPOINT"),
+    )
+    val azureOpenAiApiKey = resolveSecret(
+        "AZURE_OPENAI_API_KEY",
+        resolveSecret("AZURE_CONTENT_UNDERSTANDING_KEY"),
+    )
+    val azureOpenAiModel = resolveSecret(
+        "AZURE_OPENAI_MODEL",
+        resolveSecret("AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID", "gpt-4.1-mini"),
+    )
 
     val azureTableEndpoint = resolveSecret("AZURE_TABLE_ENDPOINT")
     val azureTableName = resolveSecret("AZURE_TABLE_NAME")
@@ -61,10 +69,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_ENDPOINT", azureEndpoint.asBuildConfigValue())
-        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_KEY", azureKey.asBuildConfigValue())
-        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_ANALYZER_ID", azureAnalyzerId.asBuildConfigValue())
-        buildConfigField("String", "AZURE_CONTENT_UNDERSTANDING_API_VERSION", azureApiVersion.asBuildConfigValue())
+        buildConfigField("String", "AZURE_OPENAI_ENDPOINT", azureOpenAiEndpoint.asBuildConfigValue())
+        buildConfigField("String", "AZURE_OPENAI_API_KEY", azureOpenAiApiKey.asBuildConfigValue())
+        buildConfigField("String", "AZURE_OPENAI_MODEL", azureOpenAiModel.asBuildConfigValue())
 
         buildConfigField("String", "AZURE_TABLE_ENDPOINT", azureTableEndpoint.asBuildConfigValue())
         buildConfigField("String", "AZURE_TABLE_NAME", azureTableName.asBuildConfigValue())

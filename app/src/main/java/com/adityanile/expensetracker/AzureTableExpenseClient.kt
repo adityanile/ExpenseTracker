@@ -317,6 +317,8 @@ object AzureTableExpenseClient {
 
         val patterns = listOf(
             "dd MMM yyyy, hh:mm a",
+            "dd MMM yyyy, h:mma",
+            "dd MMM yyyy, hh:mma",
             "hh:mm a dd MMM yyyy",
             "yyyy-MM-dd HH:mm:ss",
             "yyyy-MM-dd'T'HH:mm:ss",

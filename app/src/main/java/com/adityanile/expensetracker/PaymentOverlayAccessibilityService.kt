@@ -238,11 +238,11 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
             return
         }
 
-        val settings = AzureAnalyzerSettingsProvider.fromBuildConfig()
+        val settings = AzureOpenAiSettingsProvider.fromBuildConfig()
         if (!settings.isConfigured()) {
             Toast.makeText(
                 applicationContext,
-                "Azure secrets missing. Add in ~/.gradle/gradle.properties, project .gradle/gradle.properties, or local.properties",
+                "Azure OpenAI secrets missing. Add in ~/.gradle/gradle.properties, project .gradle/gradle.properties, or local.properties",
                 Toast.LENGTH_LONG,
             ).show()
             return
@@ -270,7 +270,7 @@ class PaymentOverlayAccessibilityService : AccessibilityService() {
             val imageBytes = bitmap.toPngBytes()
             bitmap.recycle()
 
-            val analyzeResult = AzureContentUnderstandingClient.analyzeImageBytes(imageBytes, settings)
+            val analyzeResult = AzureOpenAiExpenseClient.analyzeImageBytes(imageBytes, settings)
             isProcessingCapture = false
 
             mainHandler.post {
